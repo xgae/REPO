@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PlatformIO: Build",
+      "type": "shell",
+      "command": "pio run",
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "panel": "shared", "echo": true }
+    },
+    {
+      "label": "PlatformIO: Upload",
+      "type": "shell",
+      "command": "pio run -t upload --upload-port ${input:uploadPort}",
+      "presentation": { "panel": "shared", "echo": true }
+    },
+    {
+      "label": "PlatformIO: Monitor",
+      "type": "shell",
+      "command": "pio device monitor --port ${input:uploadPort} --baud 115200",
+      "presentation": { "panel": "shared", "echo": true }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "uploadPort",
+      "type": "promptString",
+      "description": "Serial port (e.g. /dev/ttyUSB0)",
+      "default": "/dev/ttyUSB0"
+    }
+  ]
+}
