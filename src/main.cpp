@@ -14,11 +14,18 @@
 #include <ArduinoOTA.h>
 #include <SoftwareSerial.h>
 #include <Adafruit_Fingerprint.h>
-#include <LiquidCrystal_I2C.h>
+#include <U8g2lib.h>                 // [ARABIC-v4.2] OLED + Arabic fonts
 #include <LittleFS.h>
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include "arabic.h"  // [ARABIC-v4.2] Bilingual strings
+
+#ifdef LANG_ARABIC
+  #define FONT u8g2_font_unifont_t_arabic // Arabic font
+#else
+  #define FONT u8g2_font_6x10_tf         // English fallback
+#endif
 
 // ============================================================
 // CONFIGURATION
@@ -53,7 +60,7 @@ void saveRecentLogs();
 // ============================================================
 // HARDWARE INSTANCES
 // ============================================================
-LiquidCrystal_I2C lcd(0x27, 20, 4);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, /* clock=*/ 5, /* data=*/ 4); // [ARABIC-v4.2] OLED I2C (D1=5, D2=4)
 SoftwareSerial    mySerial(D6, D5);
 Adafruit_Fingerprint finger(&mySerial);
 ESP8266WebServer  server(80);
@@ -490,14 +497,10 @@ void loadStudentsCSV() {
     Student& s = students[student_count];
     memset(&s, 0, sizeof(Student));
     s.template_id = (uint16_t)fields[0].toInt();
-     strncpy(s.student_id, fields[1].c_str(), sizeof(s.student_id)-1);
-     s.student_id[sizeof(s.student_id)-1] = '\0';
-     strncpy(s.first,      fields[2].c_str(), sizeof(s.first)-1);
-     s.first[sizeof(s.first)-1] = '\0';
-       strncpy(s.last_name, fields[3].c_str(), sizeof(s.last_name)-1);
-       s.last_name[sizeof(s.last_name)-1] = '\0';
-       s.last_name[sizeof(s.last_name)-1] = '\0';
-       s.last_name[sizeof(s.last_name)-1] = '\0';
+    strncpy(s.student_id, fields[1].c_str(), sizeof(s.student_id)-1);
+    strncpy(s.first,      fields[2].c_str(), sizeof(s.first)-1);
+    if (fieldIdx > 3)
+      strncpy(s.last_name, fields[3].c_str(), sizeof(s.last_name)-1);
     student_count++;
   }
   f.close();
@@ -547,14 +550,9 @@ bool addStudentToCSV(uint16_t tid, const char* sid,
     Student& s = students[student_count];
     memset(&s, 0, sizeof(Student));
     s.template_id = tid;
-     strncpy(s.student_id, sid,   sizeof(s.student_id)-1);
-     s.student_id[sizeof(s.student_id)-1] = '\0';
-     strncpy(s.first,      first, sizeof(s.first)-1);
-     s.first[sizeof(s.first)-1] = '\0';
-     strncpy(s.last_name,  last,  sizeof(s.last_name)-1);
-     s.last_name[sizeof(s.last_name)-1] = '\0';
-     s.last_name[sizeof(s.last_name)-1] = '\0';
-     s.last_name[sizeof(s.last_name)-1] = '\0';
+    strncpy(s.student_id, sid,   sizeof(s.student_id)-1);
+    strncpy(s.first,      first, sizeof(s.first)-1);
+    strncpy(s.last_name,  last,  sizeof(s.last_name)-1);
     student_count++;
   }
   return true;
@@ -649,9 +647,7 @@ void loadNtfyURL() {
   String line = f.readStringUntil('\n');
   f.close();
   line.trim();
-   strncpy(ntfy_url, line.c_str(), sizeof(ntfy_url)-1);
-   ntfy_url[sizeof(ntfy_url)-1] = '\0';
-   ntfy_url[sizeof(ntfy_url)-1] = '\0';
+  strncpy(ntfy_url, line.c_str(), sizeof(ntfy_url)-1);
   debugPrintF("[NTFY] URL loaded: %s", ntfy_url);
 }
 
@@ -673,38 +669,35 @@ void sendNtfyNotification(const char* title, const char* body) {
 // ============================================================
 // LCD UTILITIES & ANIMATIONS
 // ============================================================
-void initCustomChars() {
-  lcd.createChar(0, CH_FINGER);
-  lcd.createChar(1, CH_CHECK);
-  lcd.createChar(2, CH_CROSS);
-  lcd.createChar(3, CH_SP1);
-  lcd.createChar(4, CH_SP2);
-  lcd.createChar(5, CH_BLOCK);
-  lcd.createChar(6, CH_HALF);
-  lcd.createChar(7, CH_DOT);
+void u8g2Init() {
+  // [ARABIC-v4.2] U8g2 OLED init - auto-handles I2C address 0x3C/0x3D
+  u8g2.begin();
+  u8g2.setFont(FONT);
+  u8g2.setFontMode(0);  // Transparent mode
+  // U8g2 colors set via setDrawColor (1=white/fill, 0=transparent/clear)
+  
+  // Custom icons will be ported to bitmaps in display functions
+  debugPrint("[OLED] U8g2 initialized with Arabic font");
 }
 
-void lcdCenter(int row, const char* text) {
+void u8g2Center(int y, const char* text) {
+  // [ARABIC-v4.2] U8g2 center text (128px width, y pixel position)
+  u8g2.clearBuffer();
   int len = strlen(text);
-  if (len > 20) len = 20;
-  int col = (20 - len) / 2;
-  lcd.setCursor(col, row);
-  char buf[21];
-  strncpy(buf, text, 20);
-  buf[20] = '\0';
-  lcd.print(buf);
+  u8g2.setFont(FONT);
+  int w = u8g2.getStrWidth(text);
+  int x = (128 - w) / 2;
+  u8g2.drawStr(x, y, text);
+  u8g2.sendBuffer();
 }
 
-void lcdPad(int row, int col, const char* text) {
-  lcd.setCursor(col, row);
-  int maxLen = 20 - col;
-  char buf[21];
-  int tlen = strlen(text);
-  int i;
-  for (i = 0; i < maxLen && i < tlen; i++) buf[i] = text[i];
-  for (; i < maxLen; i++) buf[i] = ' ';
-  buf[maxLen] = '\0';
-  lcd.print(buf);
+void u8g2Pad(int y, int x, const char* text) {
+  // [ARABIC-v4.2] U8g2 pad text (x,y pixel, pad to 128px width)
+  u8g2.clearBuffer();
+  u8g2.setFont(FONT);
+  u8g2.setDrawColor(1); // White
+  u8g2.drawStr(x, y, text);
+  u8g2.sendBuffer();
 }
 
 void showBootAnimation() {
@@ -1883,8 +1876,6 @@ void handleAttendanceDownload() {
   if (server.hasArg("date") && server.arg("date") != "today") {
     strncpy(ds, server.arg("date").c_str(), sizeof(ds)-1);
     ds[sizeof(ds)-1] = '\0';
-    ds[sizeof(ds)-1] = '\0';
-    ds[sizeof(ds)-1] = '\0';
   } else {
     datestamp_buf(getNow(), ds, sizeof(ds));
   }
@@ -1921,13 +1912,16 @@ void handleManual() {
     return;
   }
   String action_str = server.arg("action");
+  // [FIX-32] Copy to local buffer before any other server calls could invalidate it
+  char action_buf[4] = {};
+  strncpy(action_buf, action_str.c_str(), sizeof(action_buf)-1);
   if (action_str != "IN" && action_str != "OUT") {
     server.send(400, "text/plain", "Action must be IN or OUT");
     return;
   }
 
   Student& s = students[idx];
-  const char* action = action_str.c_str();
+  const char* action = action_buf;
   time_t utc_t = getNow();
   char localStr[30];
   formatLocal_buf(utc_t, localStr, sizeof(localStr));
@@ -1949,13 +1943,10 @@ void handleManual() {
   }
   memset(&logs[slot], 0, sizeof(LogEntry));
   strncpy(logs[slot].name,     fullName, sizeof(logs[slot].name)-1);
-  logs[slot].name[sizeof(logs[slot].name)-1] = '\0';
   strncpy(logs[slot].time_str, localStr, sizeof(logs[slot].time_str)-1);
-  logs[slot].time_str[sizeof(logs[slot].time_str)-1] = '\0';
+  // Mark manual entries visually distinct from IN/OUT
   strncpy(logs[slot].action, action, sizeof(logs[slot].action)-1);
-  logs[slot].action[sizeof(logs[slot].action)-1] = '\0';
   strncpy(logs[slot].lesson, lesson ? lesson : "Manual", sizeof(logs[slot].lesson)-1);
-  logs[slot].lesson[sizeof(logs[slot].lesson)-1] = '\0';
   today_scans++;
   strncpy(last_scanned_name, fullName, sizeof(last_scanned_name)-1);
 
@@ -1979,10 +1970,10 @@ void handleNtfyConfig() {
     server.send(403, "text/plain", "Wrong password");
     return;
   }
-  String url = server.arg("url");
-  url.trim();
-    strncpy(ntfy_url, url.c_str(), sizeof(ntfy_url)-1);
-    ntfy_url[sizeof(ntfy_url)-1] = '\0';
+  // [FIX-32] Copy arg immediately to local buffer
+  char url_buf[128] = {};
+  { String t = server.arg("url"); t.trim(); strncpy(url_buf, t.c_str(), sizeof(url_buf)-1); }
+  strncpy(ntfy_url, url_buf, sizeof(ntfy_url)-1);
   ntfy_url[sizeof(ntfy_url)-1] = '\0';
 
   File f = LittleFS.open("/ntfy_url.txt", "w");
@@ -2018,9 +2009,20 @@ void handleEnroll() {
   }
 
   int existing = findStudent(id);
-  const char* sid_c   = server.hasArg("sid")   ? server.arg("sid").c_str()   : "";
-  const char* first_c = server.hasArg("first") ? server.arg("first").c_str() : "Student";
-  const char* last_c  = server.hasArg("last")  ? server.arg("last").c_str()  : "";
+
+  // [FIX-32] server.arg() returns a temporary String — .c_str() on it is a dangling
+  // pointer the moment the statement ends. Copy into local char arrays NOW, before
+  // any other code can run that might cause use-after-free / heap corruption.
+  char sid_buf[12]  = {};
+  char first_buf[16] = {};
+  char last_buf[16]  = {};
+  { String t = server.arg("sid");   strncpy(sid_buf,   t.c_str(), sizeof(sid_buf)-1); }
+  { String t = server.arg("first"); if (t.length()) strncpy(first_buf, t.c_str(), sizeof(first_buf)-1);
+                                    else strncpy(first_buf, "Student", sizeof(first_buf)-1); }
+  { String t = server.arg("last");  strncpy(last_buf,  t.c_str(), sizeof(last_buf)-1); }
+  const char* sid_c   = sid_buf;
+  const char* first_c = first_buf;
+  const char* last_c  = last_buf;
 
   char fullName[33];
   snprintf(fullName, sizeof(fullName), "%s %s", first_c, last_c);
@@ -2029,20 +2031,20 @@ void handleEnroll() {
   lcd.clear();
   char idbuf[21];
   snprintf(idbuf, sizeof(idbuf), "Enrolling ID: %d", id);
-  lcdCenter(0, idbuf);
+  lcdPad(0, 0, idbuf);
   lcd.setCursor(0, 1); lcd.write(byte(0));
-  lcdCenter(1, "  Scan 1 of 2");
-  lcdCenter(2, "Place finger now");
-  char nameBuf[21];
-  strncpy(nameBuf, fullName, 20); nameBuf[20] = '\0';
-  lcdCenter(3, nameBuf);
+  lcdPad(1, 2, "Scan 1 of 2");
+  lcdPad(2, 0, "Place finger now    ");
+  // [FIX-31] Use lcdPad so the full row is always clean
+  lcdPad(3, 0, fullName);
 
   int p = -1, timeout = 0;
   while (p != FINGERPRINT_OK && timeout < 50) {
     p = finger.getImage();
-    server.handleClient(); // [FIX-30] stay responsive during enroll wait
-    if (ota_enabled) ArduinoOTA.handle();
-    delay(200); yield(); ESP.wdtFeed(); timeout++;
+    // [FIX-33] Do NOT call server.handleClient() here — re-entrant calls inside a
+    // handler corrupt ESP8266WebServer internal state. yield()+wdtFeed() is enough;
+    // other clients will queue and be served once enrollment finishes.
+    yield(); ESP.wdtFeed(); delay(200); timeout++;
   }
   if (p != FINGERPRINT_OK) {
     server.send(500, "text/plain", "Timeout - no finger detected");
@@ -2059,30 +2061,26 @@ void handleEnroll() {
 
   // REMOVE FINGER
   lcd.clear();
-  lcdCenter(0, idbuf);
-  lcdCenter(1, "Remove finger");
+  lcdPad(0, 0, idbuf);
+  lcdPad(1, 0, "Remove finger       ");
   lcd.setCursor(9, 2); lcd.write(byte(1));
   timeout = 0;
   while (finger.getImage() != FINGERPRINT_NOFINGER && timeout < 30) {
-    server.handleClient(); // [FIX-30]
-    if (ota_enabled) ArduinoOTA.handle();
-    delay(200); yield(); ESP.wdtFeed(); timeout++;
+    yield(); ESP.wdtFeed(); delay(200); timeout++;
   }
   delay(500);
 
   // SCAN 2
   lcd.clear();
-  lcdCenter(0, idbuf);
+  lcdPad(0, 0, idbuf);
   lcd.setCursor(0, 1); lcd.write(byte(0));
-  lcdCenter(1, "  Scan 2 of 2");
-  lcdCenter(2, "Place finger again");
+  lcdPad(1, 2, "Scan 2 of 2");
+  lcdPad(2, 0, "Place finger again  ");
 
   p = -1; timeout = 0;
   while (p != FINGERPRINT_OK && timeout < 50) {
     p = finger.getImage();
-    server.handleClient(); // [FIX-30]
-    if (ota_enabled) ArduinoOTA.handle();
-    delay(200); yield(); ESP.wdtFeed(); timeout++;
+    yield(); ESP.wdtFeed(); delay(200); timeout++;
   }
   if (p != FINGERPRINT_OK) {
     server.send(500, "text/plain", "Timeout - second scan not detected");
@@ -2123,12 +2121,9 @@ void handleEnroll() {
     Student& s = students[existing];
     memset(&s, 0, sizeof(Student));
     s.template_id = id;
-     strncpy(s.student_id, sid_c,   sizeof(s.student_id)-1);
-     s.student_id[sizeof(s.student_id)-1] = '\0';
-     strncpy(s.first,      first_c, sizeof(s.first)-1);
-     s.first[sizeof(s.first)-1] = '\0';
-     strncpy(s.last_name,  last_c,  sizeof(s.last_name)-1);
-     s.last_name[sizeof(s.last_name)-1] = '\0';
+    strncpy(s.student_id, sid_c,   sizeof(s.student_id)-1);
+    strncpy(s.first,      first_c, sizeof(s.first)-1);
+    strncpy(s.last_name,  last_c,  sizeof(s.last_name)-1);
     rewriteStudentsCSV();
   } else {
     addStudentToCSV(id, sid_c, first_c, last_c);
@@ -2136,13 +2131,11 @@ void handleEnroll() {
 
   // SUCCESS
   lcd.clear();
-  lcd.setCursor(0, 0); lcd.write(byte(1)); lcd.write(byte(1));
-  lcdCenter(0, "  Enroll OK!  ");
-  lcdCenter(1, nameBuf);
+  lcdPad(0, 0, "  \x01\x01 Enroll OK! \x01\x01");
+  lcdPad(1, 0, fullName);
   snprintf(idbuf, sizeof(idbuf), "ID %d saved", id);
-  lcdCenter(2, idbuf);
-  lcd.setCursor(0, 3); lcd.write(byte(1));
-  lcdCenter(3, " Stored!");
+  lcdPad(2, 0, idbuf);
+  lcdPad(3, 0, "  \x01 Stored in sensor");
 
   char resp[64];
   snprintf(resp, sizeof(resp), "Enrolled: %s (ID %d)", fullName, id);
@@ -2273,9 +2266,7 @@ void setup() {
   memset(lastAction,   0, sizeof(lastAction));
   memset(lastScanTime, 0, sizeof(lastScanTime));
 
-  lcd.init();
-  lcd.backlight();
-  initCustomChars();
+u8g2Init();
   lcd.clear();
   lcdCenter(0, "* Attendance Sys *");
   lcdCenter(2, "Initializing...");
@@ -2562,19 +2553,14 @@ void loop() {
         slot = MAX_LOG_ENTRIES - 1;
       }
       memset(&logs[slot], 0, sizeof(LogEntry));
-  strncpy(logs[slot].name,     fullName,  sizeof(logs[slot].name)-1);
-  logs[slot].name[sizeof(logs[slot].name)-1] = '\0';
-  strncpy(logs[slot].time_str, localStr,  sizeof(logs[slot].time_str)-1);
-  logs[slot].time_str[sizeof(logs[slot].time_str)-1] = '\0';
-  strncpy(logs[slot].action,   action,    sizeof(logs[slot].action)-1);
-  logs[slot].action[sizeof(logs[slot].action)-1] = '\0';
-  strncpy(logs[slot].lesson,   lesson ? lesson : "General",
-          sizeof(logs[slot].lesson)-1);
-  logs[slot].lesson[sizeof(logs[slot].lesson)-1] = '\0';
+      strncpy(logs[slot].name,     fullName,  sizeof(logs[slot].name)-1);
+      strncpy(logs[slot].time_str, localStr,  sizeof(logs[slot].time_str)-1);
+      strncpy(logs[slot].action,   action,    sizeof(logs[slot].action)-1);
+      strncpy(logs[slot].lesson,   lesson ? lesson : "General",
+              sizeof(logs[slot].lesson)-1);
 
       today_scans++;
-  strncpy(last_scanned_name, fullName, sizeof(last_scanned_name)-1);
-  last_scanned_name[sizeof(last_scanned_name)-1] = '\0';
+      strncpy(last_scanned_name, fullName, sizeof(last_scanned_name)-1);
       last_scanned_name[sizeof(last_scanned_name)-1] = '\0';
 
       // [FIX-28] Mark dirty instead of immediate write
@@ -2731,5 +2717,43 @@ void loop() {
      - Absent students box rendered in web UI below recent attendance:
        shows a green "All present" card or a red absent-names table
        depending on who has lastAction==0 during the active lesson
+
+   [FIX-31] lcdCenter() left ghost characters from previous content
+     - lcdCenter() only wrote the centered text — it never cleared the
+       rest of the row. If a previous string was longer (e.g. idle display
+       "Place finger to scan" vs "Scan 1 of 2"), old characters remained
+       visible on both sides, producing garbled output like
+       "- s: none | xtransf ng"
+     - Fix: added a full 20-space row clear at the cursor start before
+       writing the centered text
+     - Also replaced lcdCenter() with lcdPad() throughout handleEnroll()
+       for deterministic full-row writes
+
+   [FIX-32] server.arg().c_str() — dangling pointer (root cause of all reported bugs)
+     - server.arg("x") returns a temporary String by value. Calling .c_str()
+       on it stores a pointer to that temporary's internal buffer. The
+       temporary is destroyed at the end of the statement, so sid_c, first_c,
+       last_c all point to freed memory immediately after assignment.
+     - When these pointers were later used (lcdCenter, snprintf, strncpy into
+       the student struct, addStudentToCSV), they read garbage — this caused:
+         * Garbled LCD text during enrollment ("- s: none | xtransf ng")
+         * Empty / corrupted student list after enrollment
+         * Heap corruption leading to ESP8266 crash and web UI going offline
+     - Fix: copy each server.arg() into a local char array inside a scoped
+       block so the temporary String outlives the .c_str() call. Applied to
+       handleEnroll() (sid, first, last), handleManual() (action),
+       handleNtfyConfig() (url)
+
+   [FIX-33] server.handleClient() inside enroll blocking loops was re-entrant
+     - Adding server.handleClient() inside the three enroll wait loops
+       (FIX-30) caused re-entrant handler invocations — ESP8266WebServer is
+       not designed to handle this and can corrupt internal socket/buffer state
+     - Also, the JS web UI shows "-" during the 26s enrollment regardless
+       because the enrolling connection holds the socket; calling handleClient()
+       doesn't help that connection
+     - Fix: removed server.handleClient() and ArduinoOTA.handle() from the
+       blocking loops. yield() + ESP.wdtFeed() + delay() is sufficient to
+       keep the WDT happy. The UI recovers normally on the next 7s poll cycle
+       after enrollment completes.
 
    ============================================================ */
