@@ -1,10 +1,17 @@
-/* IoT Attendance System v3.0 - ESP8266 Fixed Compilation
+/* IoT Attendance System v4.1 - ESP8266
    (c) Fajer Abednabie - Basrah, Iraq
-   Hardware: Wemos D1 + AS608 + LCD I2C 0x27 */
+   Hardware: Wemos D1 + AS608 + LCD I2C 0x27
+
+   v4.1: All bugs fixed + ntfy.sh push, manual entry, absent list,
+         flash monitor, schedule API, PWA manifest, dirty-flag saves,
+         JSON escaping, constant-time auth, 3x NTP fallback. */
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266HTTPClient.h>       // [NEW-24] ntfy.sh push notifications
+#include <ArduinoOTA.h>
 #include <SoftwareSerial.h>
 #include <Adafruit_Fingerprint.h>
 #include <LiquidCrystal_I2C.h>
@@ -18,9 +25,14 @@
 // ============================================================
 const char* WIFI_SSID     = "Abd";
 const char* WIFI_PASS     = "fajer67ii";
-const char* ADMIN_PASS    = "fajer67student";  // [NEW-05]
-const long  TZ_OFFSET_S   = 3L * 3600L;       // UTC +3
-const char* NTP_SERVER    = "pool.ntp.org";
+const char* ADMIN_PASS    = "fajer67student";
+const char* OTA_PASSWORD  = "fajer67ota";
+const char* MDNS_HOST     = "f-att";           // -> f-att.local
+const long  TZ_OFFSET_S   = 3L * 3600L;        // UTC +3
+// [FIX-27] Three NTP servers for fallback
+const char* NTP1          = "pool.ntp.org";
+const char* NTP2          = "time.cloudflare.com";
+const char* NTP3          = "time.google.com";
 
 #define FP_CONFIDENCE_THRESHOLD 50
 #define SCAN_DEBOUNCE_SEC       3
@@ -28,6 +40,15 @@ const char* NTP_SERVER    = "pool.ntp.org";
 #define SENSOR_INIT_RETRIES     3
 #define HEAP_CRITICAL_THRESHOLD 4096
 #define AUTO_RESTART_HOUR       3
+#define BUZZER_PIN D7
+#define LOG_FLUSH_DEBOUNCE_MS   30000UL  // [FIX-28] flush logs at most every 30s
+#define FLASH_WARN_PCT          80       // [NEW-26] warn when flash > 80% full
+
+// Forward declarations
+void playSuccessTone();
+void playErrorTone();
+void playLowConfidenceTone();
+void saveRecentLogs();
 
 // ============================================================
 // HARDWARE INSTANCES
@@ -50,7 +71,7 @@ uint8_t CH_HALF  [8] = { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00 };
 uint8_t CH_DOT   [8] = { 0x00, 0x00, 0x00, 0x0E, 0x0E, 0x00, 0x00, 0x00 };
 
 // ============================================================
-// STUDENT DATABASE - NO class field [NEW-09]
+// STUDENT DATABASE
 // ============================================================
 #define MAX_STUDENTS 127
 
@@ -65,13 +86,13 @@ Student students[MAX_STUDENTS];
 int student_count = 0;
 
 // ============================================================
-// ATTENDANCE LOG - persistent [NEW-04]
+// ATTENDANCE LOG
 // ============================================================
 struct LogEntry {
   char name    [33];
   char time_str[24];
   char action  [ 4];
-  char lesson  [28];  // [NEW-16]
+  char lesson  [28];
 };
 
 #define MAX_LOG_ENTRIES 40
@@ -79,13 +100,17 @@ LogEntry logs[MAX_LOG_ENTRIES];
 int  logCount    = 0;
 int  today_scans = 0;
 
+// [FIX-28] Dirty flag: set true on every change, flushed to flash periodically
+bool          logs_dirty        = false;
+unsigned long last_log_flush_ms = 0;
+
 // ============================================================
-// SCHEDULE DEFINITIONS [NEW-16/17]
+// SCHEDULE DEFINITIONS
 // Sunday (wday=0): Computer Maintenance - 3 sessions
 // Monday (wday=1): Circuit Design + Networking
 // ============================================================
 struct ScheduleSlot {
-  uint8_t     day_of_week;  // 0=Sun, 1=Mon
+  uint8_t     day_of_week;
   uint8_t     start_h, start_m;
   uint8_t     end_h,   end_m;
   const char* lesson_name;
@@ -105,6 +130,7 @@ const int SCHEDULE_COUNT = sizeof(schedule) / sizeof(schedule[0]);
 // ============================================================
 bool   wifi_connected  = false;
 bool   time_synced     = false;
+bool   ota_enabled     = false;
 char   last_sync_str[30] = "Never";
 
 uint8_t lastAction[128];
@@ -123,8 +149,11 @@ unsigned long last_heap_check   = 0;
 unsigned long last_save_time_ms = 0;
 bool          auto_restarted_today = false;
 
+// [NEW-24] ntfy.sh push notification URL (loaded from /ntfy_url.txt)
+char ntfy_url[128] = "";
+
 // ============================================================
-// DEBUG - [FIX-13] char[] not String concat
+// DEBUG
 // ============================================================
 void debugPrint(const char* msg) {
   Serial.println(msg);
@@ -139,6 +168,34 @@ void debugPrintF(const char* fmt, ...) {
   va_end(args);
   Serial.println(buf);
   Serial.flush();
+}
+
+// ============================================================
+// [FIX-21] JSON string escape helper — prevents injection via
+//          student names / lesson strings in API responses
+// ============================================================
+void jsonEscape(const char* src, char* dst, size_t dstLen) {
+  size_t j = 0;
+  for (size_t i = 0; src[i] && j + 2 < dstLen; i++) {
+    char c = src[i];
+    if (c == '"' || c == '\\') {
+      if (j + 3 >= dstLen) break;
+      dst[j++] = '\\';
+    }
+    dst[j++] = c;
+  }
+  dst[j] = '\0';
+}
+
+// [FIX-29] Constant-time password compare — prevents timing oracle attack
+bool checkAdminPass(const String& provided) {
+  const char* expected = ADMIN_PASS;
+  size_t expLen = strlen(expected);
+  if (provided.length() != expLen) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < expLen; i++)
+    diff |= (uint8_t)provided[i] ^ (uint8_t)expected[i];
+  return diff == 0;
 }
 
 // ============================================================
@@ -198,7 +255,6 @@ void datestamp_buf(time_t t, char* buf, size_t len) {
            ti->tm_year+1900, ti->tm_mon+1, ti->tm_mday);
 }
 
-// [NEW-16] Get current lesson based on schedule
 const char* getCurrentLesson(time_t t) {
   if (t < 1000000000UL) return NULL;
   time_t local = t + TZ_OFFSET_S;
@@ -215,7 +271,21 @@ const char* getCurrentLesson(time_t t) {
   return NULL;
 }
 
-// ── NTP persistence ─────────────────────────────────────
+// ============================================================
+// CRC32
+// ============================================================
+static void crc32_update(uint32_t& crc, const void* data, size_t len) {
+  const uint8_t* p = (const uint8_t*)data;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= p[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc >> 1) ^ (0xEDB88320u * (crc & 1));
+  }
+}
+
+// ============================================================
+// NTP persistence
+// ============================================================
 void saveLastTime() {
   time_t t = getNow();
   if (t < 1000000000UL) return;
@@ -251,7 +321,9 @@ bool loadLastTime() {
   return true;
 }
 
-// ── IN/OUT state persistence ────────────────────────────
+// ============================================================
+// IN/OUT state persistence
+// ============================================================
 void saveLastAction() {
   File f = LittleFS.open("/last_action.bin", "w");
   if (!f) return;
@@ -277,45 +349,100 @@ void clearLastActionForNewDay() {
   debugPrint("[STATE] New day - cleared IN/OUT");
 }
 
-// ── [NEW-04] Persistent log save/load ───────────────────
+// ============================================================
+// Persistent log save/load (CRC32 integrity)
+// ============================================================
 void saveRecentLogs() {
   File f = LittleFS.open("/recent_log.dat", "w");
   if (!f) return;
+  uint32_t crc = 0xFFFFFFFF;
+
   f.write((uint8_t*)&logCount, sizeof(logCount));
+  crc32_update(crc, &logCount, sizeof(logCount));
+
   f.write((uint8_t*)&today_scans, sizeof(today_scans));
+  crc32_update(crc, &today_scans, sizeof(today_scans));
+
   f.write((uint8_t*)current_day_stamp, 10);
+  crc32_update(crc, current_day_stamp, 10);
+
   for (int i = 0; i < logCount && i < MAX_LOG_ENTRIES; i++) {
     f.write((uint8_t*)&logs[i], sizeof(LogEntry));
+    crc32_update(crc, &logs[i], sizeof(LogEntry));
+    yield();
   }
+
+  crc = ~crc;
+  f.write((uint8_t*)&crc, sizeof(crc));
   f.close();
+
+  // [FIX-28] Reset dirty state after successful flush
+  logs_dirty = false;
+  last_log_flush_ms = millis();
 }
 
 void loadRecentLogs() {
   if (!LittleFS.exists("/recent_log.dat")) return;
   File f = LittleFS.open("/recent_log.dat", "r");
   if (!f) return;
+
   int saved_count = 0, saved_scans = 0;
   char saved_day[10] = {};
-  if (f.read((uint8_t*)&saved_count, sizeof(saved_count)) != sizeof(saved_count)) { f.close(); return; }
-  if (f.read((uint8_t*)&saved_scans, sizeof(saved_scans)) != sizeof(saved_scans)) { f.close(); return; }
-  f.read((uint8_t*)saved_day, 10);
+  uint32_t crc = 0xFFFFFFFF;
 
-  // Only load if same day
-  if (strcmp(saved_day, current_day_stamp) == 0) {
-    if (saved_count < 0 || saved_count > MAX_LOG_ENTRIES) { f.close(); return; }
-    logCount = saved_count;
-    today_scans = saved_scans;
-    for (int i = 0; i < logCount; i++) {
-      if (f.read((uint8_t*)&logs[i], sizeof(LogEntry)) != sizeof(LogEntry)) {
-        logCount = i;
-        break;
-      }
-    }
-    debugPrintF("[LOG] Restored %d entries from flash", logCount);
-  } else {
-    debugPrint("[LOG] Saved logs from different day - ignoring");
+  if (f.read((uint8_t*)&saved_count, sizeof(saved_count)) != sizeof(saved_count)) { f.close(); return; }
+  crc32_update(crc, &saved_count, sizeof(saved_count));
+  if (f.read((uint8_t*)&saved_scans, sizeof(saved_scans)) != sizeof(saved_scans)) { f.close(); return; }
+  crc32_update(crc, &saved_scans, sizeof(saved_scans));
+  f.read((uint8_t*)saved_day, 10);
+  crc32_update(crc, saved_day, 10);
+
+  if (strcmp(saved_day, current_day_stamp) != 0) {
+    debugPrint("[LOG] Different day - ignoring");
+    f.close(); return;
   }
+  if (saved_count < 0 || saved_count > MAX_LOG_ENTRIES) { f.close(); return; }
+
+  int loaded = 0;
+  for (int i = 0; i < saved_count; i++) {
+    if (f.read((uint8_t*)&logs[i], sizeof(LogEntry)) != sizeof(LogEntry)) break;
+    crc32_update(crc, &logs[i], sizeof(LogEntry));
+    loaded++;
+    yield();
+  }
+
+  crc = ~crc;
+  uint32_t stored_crc = 0;
+  if (f.available() >= (int)sizeof(stored_crc)) {
+    f.read((uint8_t*)&stored_crc, sizeof(stored_crc));
+    if (stored_crc != crc) {
+      debugPrint("[LOG] CRC mismatch - discarding corrupt data");
+      memset(logs, 0, loaded * sizeof(LogEntry));
+      f.close(); return;
+    }
+    debugPrintF("[LOG] Restored %d entries (CRC OK)", loaded);
+  } else {
+    debugPrintF("[LOG] Restored %d entries (legacy format)", loaded);
+  }
+
+  logCount    = loaded;
+  today_scans = saved_scans;
   f.close();
+}
+
+// ============================================================
+// [NEW-26] Flash capacity helper
+// ============================================================
+bool flashHasSpace(size_t needed = 512) {
+  FSInfo fs_info;
+  if (!LittleFS.info(fs_info)) return true; // assume OK if can't read
+  return (fs_info.totalBytes - fs_info.usedBytes) > needed;
+}
+
+uint8_t flashUsedPct() {
+  FSInfo fs_info;
+  if (!LittleFS.info(fs_info)) return 0;
+  return (uint8_t)((fs_info.usedBytes * 100UL) / fs_info.totalBytes);
 }
 
 // ============================================================
@@ -342,7 +469,7 @@ void loadStudentsCSV() {
   }
   File f = LittleFS.open("/students.csv", "r");
   if (!f) return;
-  f.readStringUntil('\n'); // skip header
+  f.readStringUntil('\n');
 
   while (f.available() && student_count < MAX_STUDENTS) {
     String line = f.readStringUntil('\n');
@@ -363,10 +490,14 @@ void loadStudentsCSV() {
     Student& s = students[student_count];
     memset(&s, 0, sizeof(Student));
     s.template_id = (uint16_t)fields[0].toInt();
-    strncpy(s.student_id, fields[1].c_str(), sizeof(s.student_id)-1);
-    strncpy(s.first,      fields[2].c_str(), sizeof(s.first)-1);
-    if (fieldIdx > 3)
-      strncpy(s.last_name, fields[3].c_str(), sizeof(s.last_name)-1);
+     strncpy(s.student_id, fields[1].c_str(), sizeof(s.student_id)-1);
+     s.student_id[sizeof(s.student_id)-1] = '\0';
+     strncpy(s.first,      fields[2].c_str(), sizeof(s.first)-1);
+     s.first[sizeof(s.first)-1] = '\0';
+       strncpy(s.last_name, fields[3].c_str(), sizeof(s.last_name)-1);
+       s.last_name[sizeof(s.last_name)-1] = '\0';
+       s.last_name[sizeof(s.last_name)-1] = '\0';
+       s.last_name[sizeof(s.last_name)-1] = '\0';
     student_count++;
   }
   f.close();
@@ -396,6 +527,11 @@ void rewriteStudentsCSV() {
 
 bool addStudentToCSV(uint16_t tid, const char* sid,
                      const char* first, const char* last) {
+  // [NEW-26] Guard against full flash before writing
+  if (!flashHasSpace(256)) {
+    debugPrint("[CSV] Flash full - cannot add student");
+    return false;
+  }
   if (!LittleFS.exists("/students.csv")) {
     File fh = LittleFS.open("/students.csv", "w");
     if (!fh) return false;
@@ -411,15 +547,19 @@ bool addStudentToCSV(uint16_t tid, const char* sid,
     Student& s = students[student_count];
     memset(&s, 0, sizeof(Student));
     s.template_id = tid;
-    strncpy(s.student_id, sid,   sizeof(s.student_id)-1);
-    strncpy(s.first,      first, sizeof(s.first)-1);
-    strncpy(s.last_name,  last,  sizeof(s.last_name)-1);
+     strncpy(s.student_id, sid,   sizeof(s.student_id)-1);
+     s.student_id[sizeof(s.student_id)-1] = '\0';
+     strncpy(s.first,      first, sizeof(s.first)-1);
+     s.first[sizeof(s.first)-1] = '\0';
+     strncpy(s.last_name,  last,  sizeof(s.last_name)-1);
+     s.last_name[sizeof(s.last_name)-1] = '\0';
+     s.last_name[sizeof(s.last_name)-1] = '\0';
+     s.last_name[sizeof(s.last_name)-1] = '\0';
     student_count++;
   }
   return true;
 }
 
-// [NEW-01] Delete student from CSV array and rewrite
 bool deleteStudentFromCSV(uint16_t tid) {
   int idx = findStudent(tid);
   if (idx < 0) return false;
@@ -430,9 +570,13 @@ bool deleteStudentFromCSV(uint16_t tid) {
   return true;
 }
 
-// [NEW-09] Simplified attendance CSV - no device_id, class, template_id, timezone
 void appendAttendance(const Student& s, const char* action, time_t utc_t,
                       const char* lesson) {
+  // [NEW-26] Guard against full flash
+  if (!flashHasSpace(256)) {
+    debugPrint("[ATT] Flash full - attendance NOT written");
+    return;
+  }
   char ds[10];
   datestamp_buf(utc_t, ds, sizeof(ds));
   char fname[32];
@@ -453,6 +597,12 @@ void appendAttendance(const Student& s, const char* action, time_t utc_t,
 }
 
 void appendUnknown(time_t utc_t) {
+  // [FIX-23] Skip if time is not valid yet
+  if (utc_t < 1000000000UL) {
+    debugPrint("[UNK] Time not synced - skipping unknown log");
+    return;
+  }
+  if (!flashHasSpace(128)) return;
   bool exists = LittleFS.exists("/unknowns.csv");
   File f = LittleFS.open("/unknowns.csv", "a");
   if (!f) return;
@@ -463,23 +613,61 @@ void appendUnknown(time_t utc_t) {
   f.close();
 }
 
-// [NEW-02] Clear all attendance data
+// [FIX-20] Collect filenames first, then delete — safe LittleFS pattern
 void clearAllAttendanceData() {
+  String toDelete[24];
+  int deleteCount = 0;
   Dir dir = LittleFS.openDir("/");
-  while (dir.next()) {
-    yield();
+  while (dir.next() && deleteCount < 24) {
     String fn = dir.fileName();
-    if (fn.startsWith("att_") || fn == "unknowns.csv") {
-      LittleFS.remove("/" + fn);
-    }
+    if (fn.startsWith("att_") || fn == "unknowns.csv")
+      toDelete[deleteCount++] = fn;
+    yield();
   }
+  for (int i = 0; i < deleteCount; i++) {
+    LittleFS.remove("/" + toDelete[i]);
+    yield();
+  }
+
   logCount = 0;
   today_scans = 0;
   memset(logs, 0, sizeof(logs));
   if (LittleFS.exists("/recent_log.dat")) LittleFS.remove("/recent_log.dat");
   clearLastActionForNewDay();
   last_scanned_name[0] = '\0';
+  logs_dirty = false;
   debugPrint("[CLEAR] All attendance data cleared");
+}
+
+// ============================================================
+// [NEW-24] ntfy.sh push notifications
+// ============================================================
+void loadNtfyURL() {
+  if (!LittleFS.exists("/ntfy_url.txt")) return;
+  File f = LittleFS.open("/ntfy_url.txt", "r");
+  if (!f) return;
+  String line = f.readStringUntil('\n');
+  f.close();
+  line.trim();
+   strncpy(ntfy_url, line.c_str(), sizeof(ntfy_url)-1);
+   ntfy_url[sizeof(ntfy_url)-1] = '\0';
+   ntfy_url[sizeof(ntfy_url)-1] = '\0';
+  debugPrintF("[NTFY] URL loaded: %s", ntfy_url);
+}
+
+// Non-blocking-ish push: 2s timeout so main loop isn't stuck
+void sendNtfyNotification(const char* title, const char* body) {
+  if (strlen(ntfy_url) == 0 || !wifi_connected) return;
+  WiFiClient client;
+  HTTPClient http;
+  if (!http.begin(client, ntfy_url)) return;
+  http.setTimeout(2000);
+  http.addHeader("Title", title);
+  http.addHeader("Content-Type", "text/plain; charset=utf-8");
+  http.addHeader("Priority", "default");
+  int code = http.POST(body);
+  http.end();
+  debugPrintF("[NTFY] POST -> %d", code);
 }
 
 // ============================================================
@@ -547,18 +735,11 @@ void showBootAnimation() {
   lcd.setCursor(0, 2);
   lcd.write(byte(1));
   lcdCenter(2, " System Ready!");
-  if (wifi_connected) {
-    char ip_buf[20];
-    WiFi.localIP().toString().toCharArray(ip_buf, sizeof(ip_buf));
-    lcdCenter(3, ip_buf);
-  } else {
-    lcdCenter(3, "No WiFi");
-  }
+  lcdCenter(3, wifi_connected ? "f-att.local" : "No WiFi");
   delay(1500);
   lcd.clear();
 }
 
-// [NEW-03] Fade-out animation - name dissolves right-to-left
 void showSuccessWithFade(const char* name, const char* action,
                          const char* timeStr, const char* lesson) {
   lcd.clear();
@@ -574,7 +755,6 @@ void showSuccessWithFade(const char* name, const char* action,
   snprintf(buf, sizeof(buf), " %s", displayName);
   lcdPad(1, 0, buf);
 
-  // Show lesson if available
   if (lesson && strlen(lesson) > 0) {
     snprintf(buf, sizeof(buf), " %s|%s", action, lesson);
   } else {
@@ -586,7 +766,6 @@ void showSuccessWithFade(const char* name, const char* action,
 
   delay(1200);
 
-  // Fade-out: replace chars with spaces right-to-left
   int nameLen = strlen(displayName);
   for (int i = nameLen; i >= 0; i--) {
     lcd.setCursor(1, 1);
@@ -620,13 +799,7 @@ void showUnknownAnimation() {
   lcd.write(byte(2)); lcd.write(byte(2));
   lcdCenter(1, "Not in database");
   lcdCenter(2, "Ask admin to enroll");
-  if (wifi_connected) {
-    char ip_buf[20];
-    WiFi.localIP().toString().toCharArray(ip_buf, sizeof(ip_buf));
-    lcdCenter(3, ip_buf);
-  } else {
-    lcdCenter(3, "No WiFi");
-  }
+  lcdCenter(3, wifi_connected ? "f-att.local" : "No WiFi");
   delay(2000);
   lcd.clear();
 }
@@ -644,14 +817,25 @@ void showLowConfidenceAnimation(uint16_t confidence) {
   lcd.clear();
 }
 
-// [NEW-08] No device ID on idle display, [NEW-16] shows lesson
+// [FIX-22] Show diagnostic when sensor has fingerprint but CSV doesn't
+void showOrphanAnimation(uint16_t id) {
+  lcd.clear();
+  lcdCenter(0, "!! ORPHAN SCAN !!");
+  char idbuf[21];
+  snprintf(idbuf, sizeof(idbuf), "Sensor ID: %d", id);
+  lcdCenter(1, idbuf);
+  lcdCenter(2, "No student record!");
+  lcdCenter(3, "Re-enroll to fix");
+  delay(2000);
+  lcd.clear();
+}
+
 void updateIdleDisplay() {
   if (millis() - last_idle_ms < 1000) return;
   last_idle_ms = millis();
 
   time_t t = getNow();
 
-  // Row 0: Status + lesson
   char hdr[21];
   if (!sensor_available)
     strncpy(hdr, "!SENSOR OFFLINE!", sizeof(hdr));
@@ -661,14 +845,12 @@ void updateIdleDisplay() {
     strncpy(hdr, "[NoWiFi] Attend.", sizeof(hdr));
   lcdPad(0, 0, hdr);
 
-  // Row 1: Time
   char time_buf[12];
   formatLCDTime_buf(t, time_buf, sizeof(time_buf));
   char row1[21];
   snprintf(row1, sizeof(row1), "  %s", time_buf);
   lcdPad(1, 0, row1);
 
-  // Row 2: Date or current lesson
   const char* lesson = getCurrentLesson(t);
   if (lesson) {
     char lbuf[21];
@@ -680,10 +862,12 @@ void updateIdleDisplay() {
     lcdPad(2, 0, date_buf);
   }
 
-  // Row 3: Last scan or prompt
   if (last_scanned_name[0] != '\0') {
     char s[21];
-    snprintf(s, sizeof(s), "%c %s", (char)7, last_scanned_name);
+    char trimmed[19];
+    strncpy(trimmed, last_scanned_name, 18);
+    trimmed[18] = '\0';
+    snprintf(s, sizeof(s), "%c %s", (char)7, trimmed);
     lcdPad(3, 0, s);
   } else {
     lcdPad(3, 0, sensor_available ? "Place finger to scan" : "Sensor offline!");
@@ -733,19 +917,33 @@ void checkSensorHealth() {
 // ============================================================
 uint16_t getFingerprintID() {
   if (!sensor_available) return 0;
-  if (finger.getImage()         != FINGERPRINT_OK) return 0;
-  if (finger.image2Tz()         != FINGERPRINT_OK) return 0;
-  if (finger.fingerFastSearch() != FINGERPRINT_OK) return 0;
+  if (finger.getImage()  != FINGERPRINT_OK) return 0;
+  if (finger.image2Tz()  != FINGERPRINT_OK) return 0;
+
+  uint8_t p = finger.fingerFastSearch();
+
+  if (p == FINGERPRINT_NOTFOUND) {
+    debugPrint("[AS608] No match found");
+    // [FIX-23] Only log if time is valid
+    appendUnknown(getNow());
+    playErrorTone();
+    showUnknownAnimation();
+    return 0;
+  }
+
+  if (p != FINGERPRINT_OK) return 0;
+
   if (finger.confidence < FP_CONFIDENCE_THRESHOLD) {
     debugPrintF("[AS608] Low confidence: %d", finger.confidence);
+    playLowConfidenceTone();
     showLowConfidenceAnimation(finger.confidence);
     return 0;
   }
+
   debugPrintF("[AS608] Match ID=%d conf=%d", finger.fingerID, finger.confidence);
   return finger.fingerID;
 }
 
-// [NEW-01] Delete fingerprint from sensor
 bool deleteFingerprint(uint16_t id) {
   if (!sensor_available) return false;
   uint8_t p = finger.deleteModel(id);
@@ -758,7 +956,7 @@ bool deleteFingerprint(uint16_t id) {
 }
 
 // ============================================================
-// [NEW-14/FIX-14] HEAP & STABILITY MONITORING
+// HEAP & STABILITY MONITORING
 // ============================================================
 void checkHeapHealth() {
   if (millis() - last_heap_check < 60000UL) return;
@@ -775,14 +973,12 @@ void checkHeapHealth() {
   }
 }
 
-// [NEW-15] Scheduled 3AM auto-restart as safety net
 void checkScheduledRestart() {
   time_t t = getNow();
   if (t < 1000000000UL) return;
   time_t local = t + TZ_OFFSET_S;
   struct tm* ti = gmtime(&local);
   if (ti->tm_hour == AUTO_RESTART_HOUR && ti->tm_min == 0 && !auto_restarted_today) {
-    // Only restart if uptime > 12 hours
     if (millis() > 43200000UL) {
       auto_restarted_today = true;
       debugPrint("[AUTO] Scheduled 3AM restart");
@@ -801,9 +997,29 @@ void checkScheduledRestart() {
 }
 
 // ============================================================
+// [NEW-27] PWA Manifest
+// ============================================================
+void handleManifest() {
+  server.sendHeader("Cache-Control", "max-age=3600");
+  server.send(200, "application/manifest+json",
+    "{"
+    "\"name\":\"IoT Attendance System\","
+    "\"short_name\":\"Attendance\","
+    "\"start_url\":\"/\","
+    "\"display\":\"standalone\","
+    "\"background_color\":\"#071028\","
+    "\"theme_color\":\"#0a84ff\","
+    "\"description\":\"ESP8266 fingerprint attendance tracker\","
+    "\"icons\":[]"
+    "}");
+}
+
+// ============================================================
 // WEB UI HTML
 // ============================================================
 void sendHTML() {
+  server.sendHeader("Cache-Control", "no-cache");
+  server.sendHeader("Connection", "close");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html; charset=utf-8", "");
 
@@ -813,6 +1029,9 @@ void sendHTML() {
     "<meta charset=utf-8>"
     "<meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>IoT Attendance</title>"
+    // [NEW-27] PWA manifest link
+    "<link rel=manifest href=/manifest.json>"
+    "<meta name=theme-color content='#0a84ff'>"
     "<style>"
     ":root{"
       "--bg:#071028;--surf:#0e1b2a;--acc:#0a84ff;"
@@ -833,11 +1052,17 @@ void sendHTML() {
            "border-radius:var(--r);padding:16px;margin-top:12px}"
     "h2{font-size:15px;margin-bottom:12px}"
     ".row{display:flex;gap:10px;flex-wrap:wrap}"
-    ".stat{flex:1;min-width:100px;"
+    ".stat{flex:1;min-width:80px;"
           "background:rgba(10,132,255,.08);"
           "border:1px solid rgba(10,132,255,.2);"
-          "border-radius:10px;padding:12px;text-align:center}"
-    ".val{font-size:22px;font-weight:700;color:var(--acc)}"
+          "border-radius:10px;padding:10px;text-align:center}"
+    ".stat-in{background:rgba(48,209,88,.08);border-color:rgba(48,209,88,.2)}"
+    ".stat-in .val{color:var(--ok)}"
+    ".stat-out{background:rgba(255,69,58,.08);border-color:rgba(255,69,58,.2)}"
+    ".stat-out .val{color:var(--err)}"
+    ".stat-warn{background:rgba(255,214,10,.08);border-color:rgba(255,214,10,.2)}"
+    ".stat-warn .val{color:var(--warn)}"
+    ".val{font-size:20px;font-weight:700;color:var(--acc)}"
     ".lbl{font-size:11px;color:var(--muted)}"
     "button{background:var(--acc);color:#fff;border:none;"
             "border-radius:10px;padding:8px 14px;cursor:pointer;font-size:13px;"
@@ -856,10 +1081,13 @@ void sendHTML() {
         "padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}"
     ".out{background:rgba(255,69,58,.12);color:var(--err);"
          "padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}"
-    "input{background:rgba(255,255,255,.06);"
+    ".manual-badge{background:rgba(255,214,10,.12);color:var(--warn);"
+                  "padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}"
+    "input,select{background:rgba(255,255,255,.06);"
            "border:1px solid rgba(255,255,255,.12);"
            "border-radius:8px;padding:7px 10px;color:var(--txt);"
            "font-size:13px;width:100%}"
+    "select option{background:#0e1b2a}"
     ".g2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}"
     ".msg{margin-top:8px;font-size:13px;padding:8px;border-radius:8px}"
     ".ok-msg{background:rgba(48,209,88,.1);color:var(--ok)}"
@@ -873,30 +1101,50 @@ void sendHTML() {
     ".lesson-badge{background:rgba(255,214,10,.15);color:var(--warn);"
           "padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600;"
           "display:inline-block;margin-top:4px}"
+    ".absent-row td{color:var(--err)}"
+    ".flash-bar{height:4px;border-radius:2px;margin-top:6px;"
+               "background:rgba(255,255,255,.1);overflow:hidden}"
+    ".flash-fill{height:100%;border-radius:2px;transition:width .5s;"
+                "background:var(--ok)}"
+    ".flash-fill.warn{background:var(--warn)}"
+    ".flash-fill.crit{background:var(--err)}"
     ".ee{color:transparent;cursor:default;transition:color .3s}"
     ".ee:hover,.ee:active{color:var(--acc)}"
+    ".dp-link{display:block;padding:7px 12px;border-radius:8px;color:var(--acc);"
+             "text-decoration:none;font-size:13px;margin:3px 0;"
+             "background:rgba(10,132,255,.06);border:1px solid rgba(10,132,255,.12)}"
+    ".dp-link:hover{background:rgba(10,132,255,.12)}"
+    ".dp-today{color:var(--ok);background:rgba(48,209,88,.07);"
+              "border-color:rgba(48,209,88,.18)}"
+    ".rtick{font-size:11px;color:rgba(147,171,207,.5);font-weight:400;margin-left:6px}"
     "@keyframes fadeIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}"
     ".fade-row{animation:fadeIn .4s ease-out}"
     "</style></head><body><div class=w>"
   ));
 
-  // Part 2: Header - [NEW-06] 👨🏻‍🎓, [NEW-08] no device info
+  yield();
+
+  // Part 2: Header
   server.sendContent_P(PSTR(
     "<div class=hdr>"
       "<div>"
         "<h1>\xF0\x9F\x91\xA8\xF0\x9F\x8F\xBB\xE2\x80\x8D\xF0\x9F\x8E\x93 IoT Attendance System</h1>"
-        "<div class=sub>Iraq/Basrah</div>"
+        "<div class=sub>Iraq/Basrah &bull; f-att.local</div>"
       "</div>"
       "<div style='display:flex;gap:6px;flex-wrap:wrap'>"
-        "<button class='btn-s' onclick=dlCSV()>&#8595; CSV</button>"
+        "<button class='btn-s' onclick=showDatePicker()>&#8595; CSV</button>"
         "<button class='btn-s btn-g' onclick=showEnroll()>+ Enroll</button>"
         "<button class='btn-s btn-r' onclick=showDelete()>&#128465; Delete</button>"
         "<button class='btn-s btn-w' onclick=showClear()>&#128465; Clear Logs</button>"
+        // [NEW-25] Manual entry button
+        "<button class='btn-s' style='background:rgba(255,214,10,.2);color:var(--warn)' onclick=showManual()>&#9997; Manual</button>"
+        // [NEW-24] Settings button for ntfy URL
+        "<button class='btn-s btn-c' onclick=showSettings()>&#9881;</button>"
       "</div>"
     "</div>"
   ));
 
-  // Part 3: Stats
+  // Part 3: Stats - including Flash used [NEW-26]
   server.sendContent_P(PSTR(
     "<div class=card><div class=row>"
       "<div class=stat><div class=val id=sc>-</div><div class=lbl>Today Scans</div></div>"
@@ -905,12 +1153,20 @@ void sendHTML() {
       "<div class=stat><div class=val id=st>-</div><div class=lbl>Students</div></div>"
       "<div class=stat><div class=val id=sn>-</div><div class=lbl>Sensor</div></div>"
       "<div class=stat><div class=val id=hp>-</div><div class=lbl>Free RAM</div></div>"
+      "<div class='stat stat-in'><div class=val id=pIn>-</div><div class=lbl>Present</div></div>"
+      "<div class='stat stat-out'><div class=val id=pOut>-</div><div class=lbl>Left</div></div>"
+      // [NEW-26] Flash usage stat
+      "<div class='stat' id=flashStat>"
+        "<div class=val id=flashPct>-</div>"
+        "<div class=lbl>Flash used</div>"
+        "<div class=flash-bar><div class=flash-fill id=flashBar style='width:0'></div></div>"
+      "</div>"
     "</div>"
     "<div id=lessonInfo></div>"
     "</div>"
   ));
 
-  // Part 4: Schedule card [NEW-16]
+  // Part 4: Schedule card
   server.sendContent_P(PSTR(
     "<div class=card>"
       "<h2>\xF0\x9F\x93\x85 Today's Schedule</h2>"
@@ -918,7 +1174,20 @@ void sendHTML() {
     "</div>"
   ));
 
-  // Part 5: Enroll card - [NEW-09] no class, [NEW-12] placeholders
+  yield();
+
+  // Part 4.5: Date picker card
+  server.sendContent_P(PSTR(
+    "<div class=card id=dpCard style=display:none>"
+      "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px'>"
+        "<h2>&#8595; Download Attendance</h2>"
+        "<button class='btn-s btn-c' onclick=hideAll()>&#x2715;</button>"
+      "</div>"
+      "<div id=dpContent><div class=sched>Loading available dates...</div></div>"
+    "</div>"
+  ));
+
+  // Part 5: Enroll card
   server.sendContent_P(PSTR(
     "<div class=card id=eCard style=display:none>"
       "<h2>Enroll New Student</h2>"
@@ -939,13 +1208,13 @@ void sendHTML() {
       "</div>"
       "<div style='display:flex;gap:8px;margin-top:8px'>"
         "<button onclick=doEnroll()>&#128105; Start Scan</button>"
-        "<button class=btn-c onclick=hideEnroll()>Cancel</button>"
+        "<button class=btn-c onclick=hideAll()>Cancel</button>"
       "</div>"
       "<div id=eMsg></div>"
     "</div>"
   ));
 
-  // Part 6: Delete card [NEW-01]
+  // Part 6: Delete card
   server.sendContent_P(PSTR(
     "<div class=card id=dCard style=display:none>"
       "<h2>&#128465; Delete Fingerprint</h2>"
@@ -957,14 +1226,14 @@ void sendHTML() {
       "</div>"
       "<div style='display:flex;gap:8px;margin-top:8px'>"
         "<button class=btn-r onclick=doDelete()>&#128465; Delete</button>"
-        "<button class=btn-c onclick=hideDelete()>Cancel</button>"
+        "<button class=btn-c onclick=hideAll()>Cancel</button>"
       "</div>"
       "<div id=dMsg></div>"
       "<div id=studentList style='margin-top:10px'></div>"
     "</div>"
   ));
 
-  // Part 7: Clear logs card [NEW-02]
+  // Part 7: Clear logs card
   server.sendContent_P(PSTR(
     "<div class=card id=cCard style=display:none>"
       "<h2>&#128465; Clear All Attendance Logs</h2>"
@@ -978,9 +1247,60 @@ void sendHTML() {
       "</div>"
       "<div style='display:flex;gap:8px;margin-top:8px'>"
         "<button class=btn-r onclick=doClear()>&#128465; Clear Everything</button>"
-        "<button class=btn-c onclick=hideClear()>Cancel</button>"
+        "<button class=btn-c onclick=hideAll()>Cancel</button>"
       "</div>"
       "<div id=cMsg></div>"
+    "</div>"
+  ));
+
+  yield();
+
+  // Part 7.5: [NEW-25] Manual attendance entry card
+  server.sendContent_P(PSTR(
+    "<div class=card id=mCard style=display:none>"
+      "<h2>&#9997; Manual Attendance Entry</h2>"
+      "<p style='font-size:12px;color:var(--muted);margin-bottom:10px'>"
+        "Use when the sensor is offline or a student forgot to scan.</p>"
+      "<div class=g2>"
+        "<div><div class=sub>Student</div>"
+          "<select id=mStu><option value=''>Loading...</option></select></div>"
+        "<div><div class=sub>Action</div>"
+          "<select id=mAct>"
+            "<option value=IN>IN</option>"
+            "<option value=OUT>OUT</option>"
+          "</select></div>"
+      "</div>"
+      "<div class=g2>"
+        "<div><div class=sub>Admin Password</div>"
+          "<input id=mPass type=password></div>"
+        "<div></div>"
+      "</div>"
+      "<div style='display:flex;gap:8px;margin-top:8px'>"
+        "<button class='btn-w' onclick=doManual()>&#9997; Submit</button>"
+        "<button class=btn-c onclick=hideAll()>Cancel</button>"
+      "</div>"
+      "<div id=mMsg></div>"
+    "</div>"
+  ));
+
+  // Part 7.6: [NEW-24] Settings card (ntfy.sh config)
+  server.sendContent_P(PSTR(
+    "<div class=card id=setCard style=display:none>"
+      "<h2>&#9881; Settings</h2>"
+      "<div class=sub style='margin-bottom:10px'>"
+        "Push notifications via <b>ntfy.sh</b> &mdash; "
+        "get a ping on your phone every time a student scans.</div>"
+      "<div class=g2>"
+        "<div><div class=sub>ntfy.sh URL (e.g. http://ntfy.sh/mytopic)</div>"
+          "<input id=ntfyUrl placeholder='http://ntfy.sh/my-class-topic'></div>"
+        "<div><div class=sub>Admin Password</div>"
+          "<input id=ntfyPass type=password></div>"
+      "</div>"
+      "<div style='display:flex;gap:8px;margin-top:8px'>"
+        "<button onclick=doNtfySave()>&#128276; Save URL</button>"
+        "<button class=btn-c onclick=hideAll()>Cancel</button>"
+      "</div>"
+      "<div id=setMsg></div>"
     "</div>"
   ));
 
@@ -988,7 +1308,8 @@ void sendHTML() {
   server.sendContent_P(PSTR(
     "<div class=card>"
       "<div style='display:flex;justify-content:space-between;align-items:center'>"
-        "<h2>Recent Attendance <span class=pill id=rCnt>0</span></h2>"
+        "<h2>Recent Attendance <span class=pill id=rCnt>0</span>"
+          "<span class=rtick id=rtick></span></h2>"
         "<div class=sub id=lastSync></div>"
       "</div>"
       "<div id=rTable>"
@@ -997,7 +1318,12 @@ void sendHTML() {
     "</div>"
   ));
 
-  // Part 9: Footer with easter eggs [NEW-13]
+  // Part 8.5: [NEW-27] Absent students card (shown during active lessons)
+  server.sendContent_P(PSTR(
+    "<div id=absentBox></div>"
+  ));
+
+  // Part 9: Footer
   server.sendContent_P(PSTR(
     "<div class=footer>"
       "&copy; <span class=ee title='You found it! 67 forever &#127881;' "
@@ -1007,14 +1333,15 @@ void sendHTML() {
       "<!-- Easter Egg #2: View source? Nice! The answer is always 67. -->"
       "<div style='margin-top:4px;font-size:10px;color:rgba(147,171,207,.3)' "
       "onclick='this.style.color=\"var(--warn)\";this.textContent=\"&#127881; Easter Egg #3! Secret code: F67A &#128526;\"'"
-      ">v3.0</div>"
+      ">v4.1</div>"
     "</div></div>"
   ));
+
+  yield();
 
   // Part 10: JavaScript
   server.sendContent_P(PSTR(
     "<script>"
-    // Easter egg: type "67" [NEW-13]
     "let ek='';"
     "document.addEventListener('keydown',e=>{"
       "ek+=e.key;if(ek.length>10)ek=ek.slice(-10);"
@@ -1025,14 +1352,17 @@ void sendHTML() {
       "}"
     "});"
 
-    "const SCHED=["
-      "{d:0,sh:8,sm:0,eh:9,em:0,n:'Computer Maintenance - Session 1'},"
-      "{d:0,sh:9,sm:15,eh:10,em:15,n:'Computer Maintenance - Session 2'},"
-      "{d:0,sh:10,sm:30,eh:11,em:30,n:'Computer Maintenance - Session 3'},"
-      "{d:1,sh:8,sm:0,eh:9,em:30,n:'Electronic Circuit Design'},"
-      "{d:1,sh:9,sm:45,eh:11,em:15,n:'Networking'}"
-    "];"
+    // [FIX-26] SCHED now fetched from /api/schedule — no hardcoded duplicate
+    "let SCHED=[];"
     "const DAYS=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];"
+
+    "async function loadSchedule(){"
+      "try{"
+        "const r=await fetch('/api/schedule');"
+        "SCHED=await r.json();"
+        "updateSchedule();"
+      "}catch(e){}"
+    "}"
 
     "function updateSchedule(){"
       "const now=new Date();"
@@ -1056,6 +1386,18 @@ void sendHTML() {
       "}"
       "document.getElementById('schedBox').innerHTML=html;"
     "}"
+  ));
+
+  yield();
+
+  server.sendContent_P(PSTR(
+    // Refresh tick
+    "let _rtick=7;"
+    "setInterval(()=>{"
+      "if(--_rtick<=0)_rtick=7;"
+      "const el=document.getElementById('rtick');"
+      "if(el)el.textContent='\\u27F3 '+_rtick+'s';"
+    "},1000);"
 
     "async function load(){"
       "try{"
@@ -1070,7 +1412,17 @@ void sendHTML() {
         "document.getElementById('hp').textContent=j.free_heap;"
         "document.getElementById('rCnt').textContent=j.logs.length;"
         "document.getElementById('lastSync').textContent=j.last_sync;"
-        // Lesson badge
+        "document.getElementById('pIn').textContent=j.cur_in;"
+        "document.getElementById('pOut').textContent=j.cur_out;"
+
+        // [NEW-26] Flash usage indicator
+        "const fp=j.flash_pct||0;"
+        "document.getElementById('flashPct').textContent=fp+'%';"
+        "const bar=document.getElementById('flashBar');"
+        "bar.style.width=fp+'%';"
+        "bar.className='flash-fill'+(fp>=80?' crit':fp>=60?' warn':'');"
+        "if(fp>=80)document.getElementById('flashStat').className='stat stat-warn';"
+
         "if(j.current_lesson){"
           "document.getElementById('lessonInfo').innerHTML="
             "'<div class=lesson-badge style=\"margin-top:10px\">\\uD83D\\uDCDA Now: '+j.current_lesson+'</div>';"
@@ -1078,17 +1430,35 @@ void sendHTML() {
           "document.getElementById('lessonInfo').innerHTML="
             "'<div style=\"margin-top:8px;color:var(--muted);font-size:12px\">No active lesson</div>';"
         "}"
-        "const rows=j.logs.map((e,i)=>"
-          "`<tr class=fade-row style='animation-delay:${i*50}ms'>"
-          "<td>${e.time}</td><td>${e.name}</td>"
-          "<td><span class='${e.action.toLowerCase()}'>${e.action}</span></td>"
-          "<td style='font-size:11px;color:var(--muted)'>${e.lesson||''}</td></tr>`"
-        ").join('');"
+
+        "const rows=j.logs.map((e,i)=>{"
+          "const cls=e.action.toLowerCase()==='in'?'in':(e.action.toLowerCase()==='out'?'out':'manual-badge');"
+          "return `<tr class=fade-row style='animation-delay:${i*50}ms'>`"
+          "+`<td>${e.time}</td><td>${e.name}</td>`"
+          "+`<td><span class='${cls}'>${e.action}</span></td>`"
+          "+`<td style='font-size:11px;color:var(--muted)'>${e.lesson||''}</td></tr>`;"
+        "}).join('');"
         "document.getElementById('rTable').innerHTML=rows"
           "?`<table><thead><tr><th>Time</th><th>Name</th><th>Action</th><th>Lesson</th></tr></thead>"
              "<tbody>${rows}</tbody></table>`"
           ":'<div style=\"color:var(--muted);text-align:center;padding:20px\">"
              "No scans yet today</div>';"
+
+        // [NEW-27] Absent students box
+        "const ab=document.getElementById('absentBox');"
+        "if(j.current_lesson&&j.absent){"
+          "if(j.absent.length===0){"
+            "ab.innerHTML='<div class=card style=\"border-color:rgba(48,209,88,.2)\">"
+              "<h2 style=\"color:var(--ok)\">\\u2713 All present &mdash; '+j.current_lesson+'</h2></div>';"
+          "}else{"
+            "const arows=j.absent.map(s=>`<tr class=absent-row><td>${s.fid}</td><td>${s.sid}</td><td>${s.name}</td></tr>`).join('');"
+            "ab.innerHTML='<div class=card style=\"border-color:rgba(255,69,58,.2)\">"
+              "<h2 style=\"color:var(--err);margin-bottom:8px\">\\u26A0 Absent &mdash; '+j.current_lesson"
+              "+'</h2><table><thead><tr><th>Slot</th><th>ID</th><th>Name</th></tr></thead>"
+              "<tbody>'+arows+'</tbody></table></div>';"
+          "}"
+        "}else{ab.innerHTML='';}"
+
         "updateSchedule();"
       "}catch(e){}"
     "}"
@@ -1096,16 +1466,44 @@ void sendHTML() {
       "if(s===67)return '1h 7m \\u2728';"
       "return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m';"
     "}"
-    "function dlCSV(){location.href='/api/attendance?date=today'}"
   ));
 
+  yield();
+
   server.sendContent_P(PSTR(
-    "function showEnroll(){hide('dCard');hide('cCard');show('eCard');clr('eMsg')}"
-    "function hideEnroll(){hide('eCard')}"
-    "function showDelete(){hide('eCard');hide('cCard');show('dCard');clr('dMsg');loadStudents()}"
-    "function hideDelete(){hide('dCard')}"
-    "function showClear(){hide('eCard');hide('dCard');show('cCard');clr('cMsg')}"
-    "function hideClear(){hide('cCard')}"
+    "async function showDatePicker(){"
+      "hideAll();show('dpCard');"
+      "document.getElementById('dpContent').innerHTML='<div class=sched>Loading&hellip;</div>';"
+      "try{"
+        "const r=await fetch('/api/dates');"
+        "const j=await r.json();"
+        "let html='';"
+        "if(!j.dates||!j.dates.length){"
+          "html='<div style=\"color:var(--muted);font-size:13px\">No attendance files found on device.</div>';"
+        "}else{"
+          "const sorted=[...j.dates].sort().reverse();"
+          "sorted.forEach(d=>{"
+            "const y=d.slice(0,4),m=d.slice(4,6),day=d.slice(6,8);"
+            "const isToday=(d===j.today);"
+            "html+=`<a href=\"/api/attendance?date=${d}\" class=\"dp-link${isToday?' dp-today':''}\">`"
+              "+`${isToday?'\\u2B07 Today \\u2014 ':'\\uD83D\\uDCC4 '}`"
+              "+`${day}/${m}/${y}</a>`;"
+          "});"
+        "}"
+        "document.getElementById('dpContent').innerHTML=html;"
+      "}catch(e){"
+        "document.getElementById('dpContent').innerHTML="
+          "'<div style=\"color:var(--err);font-size:13px\">Failed to load dates.</div>';"
+      "}"
+    "}"
+
+    // [FIX] All show functions use hideAll() first — no missed cards
+    "function hideAll(){['eCard','dCard','cCard','dpCard','mCard','setCard'].forEach(hide);}"
+    "function showEnroll(){hideAll();show('eCard');clr('eMsg')}"
+    "function showDelete(){hideAll();show('dCard');clr('dMsg');loadStudents()}"
+    "function showClear(){hideAll();show('cCard');clr('cMsg')}"
+    "function showManual(){hideAll();show('mCard');clr('mMsg');loadStudentsDropdown()}"
+    "function showSettings(){hideAll();show('setCard');clr('setMsg')}"
     "function show(id){document.getElementById(id).style.display=''}"
     "function hide(id){document.getElementById(id).style.display='none'}"
     "function clr(id){document.getElementById(id).innerHTML=''}"
@@ -1124,6 +1522,24 @@ void sendHTML() {
       "}catch(e){}"
     "}"
 
+    // [NEW-25] Populate manual entry student dropdown
+    "async function loadStudentsDropdown(){"
+      "try{"
+        "const r=await fetch('/api/students');"
+        "const j=await r.json();"
+        "const sel=document.getElementById('mStu');"
+        "if(!j.students||!j.students.length){"
+          "sel.innerHTML='<option>No students enrolled</option>';return;}"
+        "sel.innerHTML=j.students.map(s=>"
+          "`<option value=${s.fid}>${s.name} (Slot ${s.fid})</option>`"
+        ").join('');"
+      "}catch(e){}"
+    "}"
+  ));
+
+  yield();
+
+  server.sendContent_P(PSTR(
     "async function doEnroll(){"
       "const id=document.getElementById('eid').value;"
       "const pass=document.getElementById('ep').value;"
@@ -1140,7 +1556,7 @@ void sendHTML() {
           "+'&last='+encodeURIComponent(ln));"
         "const t=await r.text();"
         "setMsg('eMsg',r.ok?'\\u2705 '+t:'\\u274c '+t,r.ok?'ok':'err');"
-        "if(r.ok){load();setTimeout(hideEnroll,3500);}"
+        "if(r.ok){load();setTimeout(hideAll,3500);}"
       "}catch(e){setMsg('eMsg','\\u274c Connection error','err');}"
     "}"
 
@@ -1168,8 +1584,37 @@ void sendHTML() {
         "const r=await fetch('/clear?pass='+encodeURIComponent(pass));"
         "const t=await r.text();"
         "setMsg('cMsg',r.ok?'\\u2705 '+t:'\\u274c '+t,r.ok?'ok':'err');"
-        "if(r.ok){load();setTimeout(hideClear,2000);}"
+        "if(r.ok){load();setTimeout(hideAll,2000);}"
       "}catch(e){setMsg('cMsg','\\u274c Connection error','err');}"
+    "}"
+
+    // [NEW-25] Manual attendance submit
+    "async function doManual(){"
+      "const fid=document.getElementById('mStu').value;"
+      "const act=document.getElementById('mAct').value;"
+      "const pass=document.getElementById('mPass').value;"
+      "if(!fid||!pass){setMsg('mMsg','Select student and enter password.','err');return;}"
+      "try{"
+        "const r=await fetch('/manual?fid='+encodeURIComponent(fid)"
+          "+'&action='+encodeURIComponent(act)"
+          "+'&pass='+encodeURIComponent(pass));"
+        "const t=await r.text();"
+        "setMsg('mMsg',r.ok?'\\u2705 '+t:'\\u274c '+t,r.ok?'ok':'err');"
+        "if(r.ok){load();setTimeout(hideAll,2500);}"
+      "}catch(e){setMsg('mMsg','\\u274c Connection error','err');}"
+    "}"
+
+    // [NEW-24] Save ntfy URL
+    "async function doNtfySave(){"
+      "const url=document.getElementById('ntfyUrl').value.trim();"
+      "const pass=document.getElementById('ntfyPass').value;"
+      "if(!pass){setMsg('setMsg','Enter admin password.','err');return;}"
+      "try{"
+        "const r=await fetch('/ntfy/config?url='+encodeURIComponent(url)"
+          "+'&pass='+encodeURIComponent(pass));"
+        "const t=await r.text();"
+        "setMsg('setMsg',r.ok?'\\u2705 '+t:'\\u274c '+t,r.ok?'ok':'err');"
+      "}catch(e){setMsg('setMsg','\\u274c Connection error','err');}"
     "}"
 
     "function setMsg(id,m,c){"
@@ -1177,7 +1622,10 @@ void sendHTML() {
       "d.innerHTML=m;d.className='msg '+(c==='ok'?'ok-msg':'err-msg');"
     "}"
 
-    "load();setInterval(load,7000);setInterval(updateSchedule,60000);"
+    "load();"
+    "loadSchedule();"
+    "setInterval(load,7000);"
+    "setInterval(updateSchedule,60000);"
     "</script></body></html>"
   ));
 }
@@ -1188,6 +1636,20 @@ void sendHTML() {
 void handleRoot() { sendHTML(); }
 
 void handleAPIStatus() {
+  // Count current IN/OUT and build absent list for active lessons
+  int cur_in = 0, cur_out = 0;
+  for (int i = 1; i < 128; i++) {
+    if      (lastAction[i] == 1) cur_in++;
+    else if (lastAction[i] == 2) cur_out++;
+  }
+
+  FSInfo fs_info;
+  uint8_t flash_pct = 0;
+  if (LittleFS.info(fs_info))
+    flash_pct = (uint8_t)((fs_info.usedBytes * 100UL) / fs_info.totalBytes);
+
+  server.sendHeader("Cache-Control", "no-cache");
+  server.sendHeader("Connection", "close");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
 
@@ -1206,55 +1668,212 @@ void handleAPIStatus() {
   server.sendContent(buf);
   snprintf(buf, sizeof(buf), "\"free_heap\":%u,", ESP.getFreeHeap());
   server.sendContent(buf);
+  // [NEW-26] Flash usage
+  snprintf(buf, sizeof(buf), "\"flash_pct\":%d,", flash_pct);
+  server.sendContent(buf);
+  snprintf(buf, sizeof(buf), "\"cur_in\":%d,\"cur_out\":%d,", cur_in, cur_out);
+  server.sendContent(buf);
 
-  // Current lesson [NEW-16]
   const char* lesson = getCurrentLesson(getNow());
   server.sendContent("\"current_lesson\":");
   if (lesson) {
-    server.sendContent("\"");
-    server.sendContent(lesson);
-    server.sendContent("\",");
+    // [FIX-21] Escape lesson string
+    char esc[64];
+    jsonEscape(lesson, esc, sizeof(esc));
+    server.sendContent("\""); server.sendContent(esc); server.sendContent("\",");
   } else {
     server.sendContent("null,");
   }
 
   server.sendContent("\"last_sync\":\"");
   server.sendContent(last_sync_str);
-  server.sendContent("\",\"logs\":[");
+  server.sendContent("\",");
 
+  // [NEW-27] Absent list (only during active lesson)
+  server.sendContent("\"absent\":[");
+  if (lesson) {
+    bool first = true;
+    char esc1[32], esc2[32];
+    for (int i = 0; i < student_count; i++) {
+      uint16_t tid = students[i].template_id;
+      if (tid < 128 && lastAction[tid] == 0) {
+        if (!first) server.sendContent(",");
+        first = false;
+        jsonEscape(students[i].first,     esc1, sizeof(esc1));
+        jsonEscape(students[i].last_name, esc2, sizeof(esc2));
+        snprintf(buf, sizeof(buf), "{\"fid\":%d,\"sid\":\"%s\",\"name\":\"%s %s\"}",
+                 tid, students[i].student_id, esc1, esc2);
+        server.sendContent(buf);
+        yield();
+      }
+    }
+  }
+  server.sendContent("],");
+
+  // [FIX-21] Escape all log fields
+  server.sendContent("\"logs\":[");
   bool first = true;
+  char esc[64];
   for (int i = logCount - 1; i >= 0; i--) {
     if (!first) server.sendContent(",");
     first = false;
     server.sendContent("{\"time\":\"");
-    server.sendContent(logs[i].time_str);
+    jsonEscape(logs[i].time_str, esc, sizeof(esc));
+    server.sendContent(esc);
     server.sendContent("\",\"name\":\"");
-    server.sendContent(logs[i].name);
+    jsonEscape(logs[i].name, esc, sizeof(esc));
+    server.sendContent(esc);
     server.sendContent("\",\"action\":\"");
-    server.sendContent(logs[i].action);
+    jsonEscape(logs[i].action, esc, sizeof(esc));
+    server.sendContent(esc);
     server.sendContent("\",\"lesson\":\"");
-    server.sendContent(logs[i].lesson);
+    jsonEscape(logs[i].lesson, esc, sizeof(esc));
+    server.sendContent(esc);
     server.sendContent("\"}");
     yield();
   }
   server.sendContent("]}");
 }
 
-// Student list API for delete UI
 void handleAPIStudents() {
+  server.sendHeader("Cache-Control", "no-cache");
+  server.sendHeader("Connection", "close");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
   server.sendContent("{\"students\":[");
   bool first = true;
+  char esc1[32], esc2[32];
   for (int i = 0; i < student_count; i++) {
     if (!first) server.sendContent(",");
     first = false;
-    char buf[100];
+    // [FIX-21] Escape name fields
+    jsonEscape(students[i].first,     esc1, sizeof(esc1));
+    jsonEscape(students[i].last_name, esc2, sizeof(esc2));
+    char buf[120];
     snprintf(buf, sizeof(buf), "{\"fid\":%d,\"sid\":\"%s\",\"name\":\"%s %s\"}",
-             students[i].template_id, students[i].student_id,
-             students[i].first, students[i].last_name);
+             students[i].template_id, students[i].student_id, esc1, esc2);
     server.sendContent(buf);
     yield();
+  }
+  server.sendContent("]}");
+}
+
+// [NEW-27] Serve schedule from C++ source — JS fetches this instead of hardcoding
+void handleAPISchedule() {
+  const char* days[] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+  server.sendHeader("Cache-Control", "no-cache");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent("[");
+  for (int i = 0; i < SCHEDULE_COUNT; i++) {
+    if (i) server.sendContent(",");
+    char buf[200];
+    snprintf(buf, sizeof(buf),
+      "{\"d\":%d,\"day\":\"%s\",\"sh\":%d,\"sm\":%d,\"eh\":%d,\"em\":%d,\"n\":\"%s\"}",
+      schedule[i].day_of_week, days[schedule[i].day_of_week],
+      schedule[i].start_h, schedule[i].start_m,
+      schedule[i].end_h,   schedule[i].end_m,
+      schedule[i].lesson_name);
+    server.sendContent(buf);
+  }
+  server.sendContent("]");
+}
+
+// [NEW-27] Absent students endpoint (standalone, for external tools)
+void handleAPIAbsent() {
+  server.sendHeader("Cache-Control", "no-cache");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  const char* lesson = getCurrentLesson(getNow());
+  server.sendContent("{\"during_lesson\":");
+  server.sendContent(lesson ? "true" : "false");
+  server.sendContent(",\"lesson\":");
+  if (lesson) {
+    char esc[64]; jsonEscape(lesson, esc, sizeof(esc));
+    server.sendContent("\""); server.sendContent(esc); server.sendContent("\"");
+  } else server.sendContent("null");
+  server.sendContent(",\"absent\":[");
+
+  bool first = true;
+  char esc1[32], esc2[32], buf[120];
+  for (int i = 0; i < student_count; i++) {
+    uint16_t tid = students[i].template_id;
+    if (tid < 128 && lastAction[tid] == 0) {
+      if (!first) server.sendContent(",");
+      first = false;
+      jsonEscape(students[i].first,     esc1, sizeof(esc1));
+      jsonEscape(students[i].last_name, esc2, sizeof(esc2));
+      snprintf(buf, sizeof(buf), "{\"fid\":%d,\"sid\":\"%s\",\"name\":\"%s %s\"}",
+               tid, students[i].student_id, esc1, esc2);
+      server.sendContent(buf);
+      yield();
+    }
+  }
+  server.sendContent("]}");
+}
+
+void handleAPIDates() {
+  server.sendHeader("Cache-Control", "no-cache");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  char today_ds[10];
+  datestamp_buf(getNow(), today_ds, sizeof(today_ds));
+  server.sendContent("{\"today\":\"");
+  server.sendContent(today_ds);
+  server.sendContent("\",\"dates\":[");
+
+  bool first = true;
+  Dir dir = LittleFS.openDir("/");
+  while (dir.next()) {
+    yield();
+    String fn = dir.fileName();
+    if (fn.startsWith("att_") && fn.endsWith(".csv")) {
+      String ds = fn.substring(4, 12);
+      if (ds.length() == 8) {
+        if (!first) server.sendContent(",");
+        first = false;
+        server.sendContent("\"");
+        server.sendContent(ds.c_str());
+        server.sendContent("\"");
+      }
+    }
+  }
+  server.sendContent("]}");
+}
+
+void handleAPIStats() {
+  server.sendHeader("Cache-Control", "no-cache");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  int cur_in = 0, cur_out = 0;
+  for (int i = 1; i < 128; i++) {
+    if      (lastAction[i] == 1) cur_in++;
+    else if (lastAction[i] == 2) cur_out++;
+  }
+
+  char buf[64];
+  snprintf(buf, sizeof(buf), "{\"total_in\":%d,\"total_out\":%d,\"students\":[",
+           cur_in, cur_out);
+  server.sendContent(buf);
+
+  bool first = true;
+  for (int i = 0; i < student_count; i++) {
+    uint16_t tid = students[i].template_id;
+    if (tid < 128 && lastAction[tid] != 0) {
+      if (!first) server.sendContent(",");
+      first = false;
+      snprintf(buf, sizeof(buf), "{\"fid\":%d,\"status\":\"%s\"}",
+               tid, lastAction[tid] == 1 ? "IN" : "OUT");
+      server.sendContent(buf);
+      yield();
+    }
   }
   server.sendContent("]}");
 }
@@ -1263,6 +1882,8 @@ void handleAttendanceDownload() {
   char ds[10];
   if (server.hasArg("date") && server.arg("date") != "today") {
     strncpy(ds, server.arg("date").c_str(), sizeof(ds)-1);
+    ds[sizeof(ds)-1] = '\0';
+    ds[sizeof(ds)-1] = '\0';
     ds[sizeof(ds)-1] = '\0';
   } else {
     datestamp_buf(getNow(), ds, sizeof(ds));
@@ -1278,8 +1899,104 @@ void handleAttendanceDownload() {
   char disposition[64];
   snprintf(disposition, sizeof(disposition), "attachment; filename=attendance_%s.csv", ds);
   server.sendHeader("Content-Disposition", disposition);
+  server.sendHeader("Connection", "close");
   server.streamFile(f, "text/csv");
   f.close();
+}
+
+// [NEW-25] Manual attendance entry
+void handleManual() {
+  if (!checkAdminPass(server.arg("pass"))) {  // [FIX-29]
+    server.send(403, "text/plain", "Wrong password");
+    return;
+  }
+  uint16_t fid = (uint16_t)server.arg("fid").toInt();
+  if (fid == 0 || fid > 127) {
+    server.send(400, "text/plain", "Invalid fingerprint slot");
+    return;
+  }
+  int idx = findStudent(fid);
+  if (idx < 0) {
+    server.send(404, "text/plain", "Student not found in database");
+    return;
+  }
+  String action_str = server.arg("action");
+  if (action_str != "IN" && action_str != "OUT") {
+    server.send(400, "text/plain", "Action must be IN or OUT");
+    return;
+  }
+
+  Student& s = students[idx];
+  const char* action = action_str.c_str();
+  time_t utc_t = getNow();
+  char localStr[30];
+  formatLocal_buf(utc_t, localStr, sizeof(localStr));
+  const char* lesson = getCurrentLesson(utc_t);
+
+  if (fid < 128) lastAction[fid] = (action_str == "IN") ? 1 : 2;
+  appendAttendance(s, action, utc_t, lesson);
+  saveLastAction();
+
+  char fullName[33];
+  snprintf(fullName, sizeof(fullName), "%s %s", s.first, s.last_name);
+
+  int slot;
+  if (logCount < MAX_LOG_ENTRIES) {
+    slot = logCount++;
+  } else {
+    for (int i = 0; i < MAX_LOG_ENTRIES - 1; i++) logs[i] = logs[i+1];
+    slot = MAX_LOG_ENTRIES - 1;
+  }
+  memset(&logs[slot], 0, sizeof(LogEntry));
+  strncpy(logs[slot].name,     fullName, sizeof(logs[slot].name)-1);
+  logs[slot].name[sizeof(logs[slot].name)-1] = '\0';
+  strncpy(logs[slot].time_str, localStr, sizeof(logs[slot].time_str)-1);
+  logs[slot].time_str[sizeof(logs[slot].time_str)-1] = '\0';
+  strncpy(logs[slot].action, action, sizeof(logs[slot].action)-1);
+  logs[slot].action[sizeof(logs[slot].action)-1] = '\0';
+  strncpy(logs[slot].lesson, lesson ? lesson : "Manual", sizeof(logs[slot].lesson)-1);
+  logs[slot].lesson[sizeof(logs[slot].lesson)-1] = '\0';
+  today_scans++;
+  strncpy(last_scanned_name, fullName, sizeof(last_scanned_name)-1);
+
+  logs_dirty = true;  // [FIX-28] schedule flush, don't write immediately
+
+  // [NEW-24] Push notification for manual entry
+  char ntfyTitle[48], ntfyBody[80];
+  snprintf(ntfyTitle, sizeof(ntfyTitle), "Manual: %s", fullName);
+  snprintf(ntfyBody, sizeof(ntfyBody), "%s %s | %s", action, lesson ? lesson : "General", localStr);
+  sendNtfyNotification(ntfyTitle, ntfyBody);
+
+  char resp[64];
+  snprintf(resp, sizeof(resp), "Manual %s: %s", action, fullName);
+  server.send(200, "text/plain", resp);
+  debugPrintF("[MANUAL] %s -> %s", fullName, action);
+}
+
+// [NEW-24] Save ntfy URL via web UI
+void handleNtfyConfig() {
+  if (!checkAdminPass(server.arg("pass"))) {  // [FIX-29]
+    server.send(403, "text/plain", "Wrong password");
+    return;
+  }
+  String url = server.arg("url");
+  url.trim();
+    strncpy(ntfy_url, url.c_str(), sizeof(ntfy_url)-1);
+    ntfy_url[sizeof(ntfy_url)-1] = '\0';
+  ntfy_url[sizeof(ntfy_url)-1] = '\0';
+
+  File f = LittleFS.open("/ntfy_url.txt", "w");
+  if (f) { f.println(ntfy_url); f.close(); }
+
+  if (strlen(ntfy_url) == 0) {
+    server.send(200, "text/plain", "ntfy notifications disabled.");
+  } else {
+    char resp[80];
+    snprintf(resp, sizeof(resp), "ntfy URL saved. Sending test ping to: %s", ntfy_url);
+    sendNtfyNotification("f-att test", "Push notifications are active!");
+    server.send(200, "text/plain", resp);
+  }
+  debugPrintF("[NTFY] URL set to: %s", ntfy_url);
 }
 
 void handleEnroll() {
@@ -1289,7 +2006,7 @@ void handleEnroll() {
     server.send(503, "text/plain", "Sensor offline - check wiring and restart");
     return;
   }
-  if (server.arg("pass") != String(ADMIN_PASS)) {
+  if (!checkAdminPass(server.arg("pass"))) {  // [FIX-29]
     server.send(403, "text/plain", "Wrong password");
     return;
   }
@@ -1323,7 +2040,9 @@ void handleEnroll() {
   int p = -1, timeout = 0;
   while (p != FINGERPRINT_OK && timeout < 50) {
     p = finger.getImage();
-    delay(200); yield(); timeout++;
+    server.handleClient(); // [FIX-30] stay responsive during enroll wait
+    if (ota_enabled) ArduinoOTA.handle();
+    delay(200); yield(); ESP.wdtFeed(); timeout++;
   }
   if (p != FINGERPRINT_OK) {
     server.send(500, "text/plain", "Timeout - no finger detected");
@@ -1338,14 +2057,16 @@ void handleEnroll() {
     lcd.clear(); return;
   }
 
-  // REMOVE
+  // REMOVE FINGER
   lcd.clear();
   lcdCenter(0, idbuf);
   lcdCenter(1, "Remove finger");
   lcd.setCursor(9, 2); lcd.write(byte(1));
   timeout = 0;
   while (finger.getImage() != FINGERPRINT_NOFINGER && timeout < 30) {
-    delay(200); yield(); timeout++;
+    server.handleClient(); // [FIX-30]
+    if (ota_enabled) ArduinoOTA.handle();
+    delay(200); yield(); ESP.wdtFeed(); timeout++;
   }
   delay(500);
 
@@ -1359,7 +2080,9 @@ void handleEnroll() {
   p = -1; timeout = 0;
   while (p != FINGERPRINT_OK && timeout < 50) {
     p = finger.getImage();
-    delay(200); yield(); timeout++;
+    server.handleClient(); // [FIX-30]
+    if (ota_enabled) ArduinoOTA.handle();
+    delay(200); yield(); ESP.wdtFeed(); timeout++;
   }
   if (p != FINGERPRINT_OK) {
     server.send(500, "text/plain", "Timeout - second scan not detected");
@@ -1374,7 +2097,7 @@ void handleEnroll() {
     lcd.clear(); return;
   }
 
-  // CREATE & STORE
+  // CREATE & STORE MODEL
   p = finger.createModel();
   if (p != FINGERPRINT_OK) {
     if (p == FINGERPRINT_ENROLLMISMATCH)
@@ -1400,9 +2123,12 @@ void handleEnroll() {
     Student& s = students[existing];
     memset(&s, 0, sizeof(Student));
     s.template_id = id;
-    strncpy(s.student_id, sid_c,   sizeof(s.student_id)-1);
-    strncpy(s.first,      first_c, sizeof(s.first)-1);
-    strncpy(s.last_name,  last_c,  sizeof(s.last_name)-1);
+     strncpy(s.student_id, sid_c,   sizeof(s.student_id)-1);
+     s.student_id[sizeof(s.student_id)-1] = '\0';
+     strncpy(s.first,      first_c, sizeof(s.first)-1);
+     s.first[sizeof(s.first)-1] = '\0';
+     strncpy(s.last_name,  last_c,  sizeof(s.last_name)-1);
+     s.last_name[sizeof(s.last_name)-1] = '\0';
     rewriteStudentsCSV();
   } else {
     addStudentToCSV(id, sid_c, first_c, last_c);
@@ -1425,11 +2151,10 @@ void handleEnroll() {
   lcd.clear();
 }
 
-// [NEW-01] Delete handler
 void handleDelete() {
   debugPrint("=== DELETE START ===");
 
-  if (server.arg("pass") != String(ADMIN_PASS)) {
+  if (!checkAdminPass(server.arg("pass"))) {  // [FIX-29]
     server.send(403, "text/plain", "Wrong password");
     return;
   }
@@ -1455,6 +2180,7 @@ void handleDelete() {
 
   if (id < 128) {
     lastAction[id] = 0;
+    lastScanTime[id] = 0;  // [FIX-24] clear debounce timer for deleted slot
     saveLastAction();
   }
 
@@ -1483,9 +2209,8 @@ void handleDelete() {
   lcd.clear();
 }
 
-// [NEW-02] Clear all attendance handler
 void handleClear() {
-  if (server.arg("pass") != String(ADMIN_PASS)) {
+  if (!checkAdminPass(server.arg("pass"))) {  // [FIX-29]
     server.send(403, "text/plain", "Wrong password");
     return;
   }
@@ -1499,7 +2224,6 @@ void handleClear() {
   server.send(200, "text/plain", "All attendance data cleared. Students remain enrolled.");
 }
 
-// [NEW-13] Easter egg endpoint
 void handleEasterEgg67() {
   server.send(200, "text/html",
     "<html><body style='background:#071028;color:#ffd60a;display:flex;"
@@ -1511,8 +2235,31 @@ void handleEasterEgg67() {
     "<div style='font-size:16px;margin-top:10px;color:#93abcf'>"
     "Fajer Abednabie &bull; Basrah, Iraq</div>"
     "<div style='font-size:14px;margin-top:20px;color:#30d158'>"
-    "Easter Egg #5: The magic number lives here forever.(i use Arch Linux btw.)</div>"
+    "Easter Egg #5: The magic number lives here forever. (i use Arch Linux btw.)</div>"
     "</body></html>");
+}
+
+// ============================================================
+// BUZZER TONES — iPhone Face ID haptic style
+// ============================================================
+void playSuccessTone() {
+  tone(BUZZER_PIN, 1050); delay(25); noTone(BUZZER_PIN);
+  delay(18);
+  tone(BUZZER_PIN, 1280); delay(40); noTone(BUZZER_PIN);
+}
+
+void playErrorTone() {
+  tone(BUZZER_PIN, 600); delay(32); noTone(BUZZER_PIN);
+  delay(20);
+  tone(BUZZER_PIN, 500); delay(32); noTone(BUZZER_PIN);
+  delay(20);
+  tone(BUZZER_PIN, 380); delay(50); noTone(BUZZER_PIN);
+}
+
+void playLowConfidenceTone() {
+  tone(BUZZER_PIN, 820); delay(28); noTone(BUZZER_PIN);
+  delay(16);
+  tone(BUZZER_PIN, 820); delay(28); noTone(BUZZER_PIN);
 }
 
 // ============================================================
@@ -1526,7 +2273,6 @@ void setup() {
   memset(lastAction,   0, sizeof(lastAction));
   memset(lastScanTime, 0, sizeof(lastScanTime));
 
-  // LCD
   lcd.init();
   lcd.backlight();
   initCustomChars();
@@ -1535,6 +2281,8 @@ void setup() {
   lcdCenter(2, "Initializing...");
   lcdCenter(3, "(c) F.Abednabie");
   delay(800);
+
+  pinMode(BUZZER_PIN, OUTPUT);
 
   // LittleFS
   lcd.clear();
@@ -1545,24 +2293,23 @@ void setup() {
     loadStudentsCSV();
     loadLastTime();
     loadLastAction();
+    loadNtfyURL();  // [NEW-24]
   } else {
     lcdCenter(2, "Storage WARN");
   }
   delay(500);
 
-  // Initialize day stamp before loading logs
   datestamp_buf(getNow(), current_day_stamp, sizeof(current_day_stamp));
-
-  // [NEW-04] Load persistent logs
   loadRecentLogs();
 
-  // WiFi - [FIX-16] persistent(false)
+  // WiFi
   lcd.clear();
   lcdCenter(0, "* Attendance Sys *");
   lcdCenter(1, "Connecting WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
+  WiFi.hostname(MDNS_HOST);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   int wTry = 0;
@@ -1582,7 +2329,51 @@ void setup() {
     WiFi.localIP().toString().toCharArray(ip_buf, sizeof(ip_buf));
     lcdCenter(3, ip_buf);
 
-    configTime(0, 0, NTP_SERVER);
+    // [FIX-25] mDNS + OTA both inside the success block
+    if (MDNS.begin(MDNS_HOST)) {
+      MDNS.addService("http", "tcp", 80);
+      debugPrint("[mDNS] f-att.local started");
+
+      ArduinoOTA.setHostname(MDNS_HOST);
+      ArduinoOTA.setPassword(OTA_PASSWORD);
+      ArduinoOTA.onStart([]() {
+        debugPrint("[OTA] Start");
+        lcd.clear();
+        lcdCenter(0, "OTA Update");
+        lcdCenter(1, "Do not power off!");
+        saveLastTime(); saveLastAction(); saveRecentLogs();
+      });
+      ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        static int last_pct = -1;
+        int pct = progress / (total / 100);
+        if (pct != last_pct) {
+          last_pct = pct;
+          char buf[21];
+          snprintf(buf, sizeof(buf), "Progress: %d%%", pct);
+          lcdPad(2, 0, buf);
+        }
+      });
+      ArduinoOTA.onEnd([]() {
+        debugPrint("[OTA] Done");
+        lcd.clear();
+        lcdCenter(0, "OTA Complete!");
+        lcdCenter(1, "Rebooting...");
+        delay(500);
+      });
+      ArduinoOTA.onError([](ota_error_t error) {
+        debugPrintF("[OTA] Error %u", error);
+        lcd.clear();
+        lcdCenter(0, "OTA Error!");
+      });
+      ArduinoOTA.begin();
+      ota_enabled = true;  // [FIX-25] only set when OTA actually started
+      debugPrint("[OTA] Ready");
+    } else {
+      debugPrint("[mDNS] Start failed");
+    }
+
+    // [FIX-27] Three NTP fallback servers
+    configTime(0, 0, NTP1, NTP2, NTP3);
     delay(100);
     int nTry = 0;
     while (getNow() < 1000000000UL && nTry < 15) {
@@ -1592,7 +2383,6 @@ void setup() {
       time_synced = true;
       formatLocal_buf(getNow(), last_sync_str, sizeof(last_sync_str));
       saveLastTime();
-      // Re-calculate day stamp with real time
       datestamp_buf(getNow(), current_day_stamp, sizeof(current_day_stamp));
     } else {
       lcdCenter(2, "NTP fail, using saved");
@@ -1624,39 +2414,51 @@ void setup() {
   }
   delay(800);
 
-  // Web server routes
+  // Routes
   server.on("/",               HTTP_GET, handleRoot);
   server.on("/enroll",         HTTP_GET, handleEnroll);
   server.on("/delete",         HTTP_GET, handleDelete);
   server.on("/clear",          HTTP_GET, handleClear);
+  server.on("/manual",         HTTP_GET, handleManual);         // [NEW-25]
+  server.on("/ntfy/config",    HTTP_GET, handleNtfyConfig);     // [NEW-24]
+  server.on("/manifest.json",  HTTP_GET, handleManifest);       // [NEW-27]
   server.on("/api/status",     HTTP_GET, handleAPIStatus);
   server.on("/api/attendance", HTTP_GET, handleAttendanceDownload);
   server.on("/api/students",   HTTP_GET, handleAPIStudents);
+  server.on("/api/dates",      HTTP_GET, handleAPIDates);
+  server.on("/api/stats",      HTTP_GET, handleAPIStats);
+  server.on("/api/absent",     HTTP_GET, handleAPIAbsent);      // [NEW-27]
+  server.on("/api/schedule",   HTTP_GET, handleAPISchedule);    // [FIX-26]
   server.on("/67",             HTTP_GET, handleEasterEgg67);
 
   server.begin();
   debugPrint("Web server started on port 80");
 
-  // Boot animation
   showBootAnimation();
 
   debugPrintF("[HEAP] Free: %u bytes", ESP.getFreeHeap());
-  debugPrint("=== Setup complete v3.0 ===");
+  debugPrintF("[FLASH] Used: %d%%", flashUsedPct());
+  debugPrint("=== Setup complete v4.1 ===");
   if (wifi_connected)
-    debugPrintF("IP: %s", WiFi.localIP().toString().c_str());
+    debugPrintF("IP: %s  mDNS: http://f-att.local", WiFi.localIP().toString().c_str());
+  if (strlen(ntfy_url) > 0)
+    debugPrintF("[NTFY] Push active: %s", ntfy_url);
 }
 
 // ============================================================
 // LOOP
 // ============================================================
 void loop() {
+  if (ota_enabled) ArduinoOTA.handle();
+  if (wifi_connected) MDNS.update();
+
   server.handleClient();
   yield();
 
-  // NTP re-sync every 30 minutes
+  // NTP re-sync every 30 min — [FIX-27] three servers already set in configTime
   if (wifi_connected && (millis() - last_ntp_ms > 1800000UL)) {
     last_ntp_ms = millis();
-    configTime(0, 0, NTP_SERVER);
+    configTime(0, 0, NTP1, NTP2, NTP3);
     delay(100); yield();
     unsigned long waitStart = millis();
     while (getNow() < 1000000000UL && millis() - waitStart < 2000) {
@@ -1669,13 +2471,19 @@ void loop() {
     }
   }
 
-  // Periodic time save (every 10 min)
+  // Periodic time save
   if (millis() - last_save_time_ms > 600000UL) {
     last_save_time_ms = millis();
     saveLastTime();
   }
 
-  // WiFi reconnect check (every 30s)
+  // [FIX-28] Flush dirty log to flash — debounced, not on every scan
+  if (logs_dirty && (millis() - last_log_flush_ms > LOG_FLUSH_DEBOUNCE_MS)) {
+    saveRecentLogs();
+    // saveRecentLogs() resets logs_dirty and last_log_flush_ms internally
+  }
+
+  // WiFi reconnect check
   if (millis() - last_wifi_ms > 30000UL) {
     last_wifi_ms = millis();
     if (WiFi.status() != WL_CONNECTED) {
@@ -1699,24 +2507,19 @@ void loop() {
       memset(logs, 0, sizeof(logs));
       clearLastActionForNewDay();
       if (LittleFS.exists("/recent_log.dat")) LittleFS.remove("/recent_log.dat");
+      logs_dirty = false;
       auto_restarted_today = false;
     }
   }
 
-  // Sensor health check
   checkSensorHealth();
-
-  // [FIX-14] Heap monitoring
   checkHeapHealth();
-
-  // [NEW-15] Scheduled auto-restart
   checkScheduledRestart();
 
   // ── FINGERPRINT SCAN ──
   uint16_t id = getFingerprintID();
 
   if (id > 0) {
-    // Per-student debounce
     if (id < 128) {
       unsigned long now_ms = millis();
       if (now_ms - lastScanTime[id] < (unsigned long)SCAN_DEBOUNCE_SEC * 1000UL) {
@@ -1731,13 +2534,11 @@ void loop() {
     formatLocal_buf(utc_t, localStr, sizeof(localStr));
     int idx = findStudent(id);
 
-    // Get current lesson [NEW-16]
     const char* lesson = getCurrentLesson(utc_t);
 
     if (idx >= 0) {
       Student& s = students[idx];
 
-      // IN / OUT toggle
       const char* action;
       if (id < 128) {
         if (lastAction[id] != 1) { action = "IN";  lastAction[id] = 1; }
@@ -1753,7 +2554,6 @@ void loop() {
       appendAttendance(s, action, utc_t, lesson);
       saveLastAction();
 
-      // Update RAM log
       int slot;
       if (logCount < MAX_LOG_ENTRIES) {
         slot = logCount++;
@@ -1762,139 +2562,174 @@ void loop() {
         slot = MAX_LOG_ENTRIES - 1;
       }
       memset(&logs[slot], 0, sizeof(LogEntry));
-      strncpy(logs[slot].name,     fullName,  sizeof(logs[slot].name)-1);
-      strncpy(logs[slot].time_str, localStr,  sizeof(logs[slot].time_str)-1);
-      strncpy(logs[slot].action,   action,    sizeof(logs[slot].action)-1);
-      strncpy(logs[slot].lesson,   lesson ? lesson : "General",
-              sizeof(logs[slot].lesson)-1);
+  strncpy(logs[slot].name,     fullName,  sizeof(logs[slot].name)-1);
+  logs[slot].name[sizeof(logs[slot].name)-1] = '\0';
+  strncpy(logs[slot].time_str, localStr,  sizeof(logs[slot].time_str)-1);
+  logs[slot].time_str[sizeof(logs[slot].time_str)-1] = '\0';
+  strncpy(logs[slot].action,   action,    sizeof(logs[slot].action)-1);
+  logs[slot].action[sizeof(logs[slot].action)-1] = '\0';
+  strncpy(logs[slot].lesson,   lesson ? lesson : "General",
+          sizeof(logs[slot].lesson)-1);
+  logs[slot].lesson[sizeof(logs[slot].lesson)-1] = '\0';
 
       today_scans++;
-
-      strncpy(last_scanned_name, fullName, sizeof(last_scanned_name)-1);
+  strncpy(last_scanned_name, fullName, sizeof(last_scanned_name)-1);
+  last_scanned_name[sizeof(last_scanned_name)-1] = '\0';
       last_scanned_name[sizeof(last_scanned_name)-1] = '\0';
 
-      // [NEW-04] Persist logs
-      saveRecentLogs();
+      // [FIX-28] Mark dirty instead of immediate write
+      logs_dirty = true;
 
+      // [NEW-24] ntfy.sh push notification on scan
+      char ntfyTitle[48], ntfyBody[80];
+      snprintf(ntfyTitle, sizeof(ntfyTitle), "%s — %s", fullName, action);
+      snprintf(ntfyBody, sizeof(ntfyBody), "%s | %s", lesson ? lesson : "General", localStr);
+      sendNtfyNotification(ntfyTitle, ntfyBody);
+
+      playSuccessTone();
       showSuccessWithFade(fullName, action, localStr, lesson);
-
     } else {
-      debugPrintF("SCAN: Unknown template %d", id);
-      appendUnknown(utc_t);
-      showUnknownAnimation();
+      // [FIX-22] Was a silent fail — now shows diagnostic on LCD
+      debugPrintF("[ORPHAN] Sensor ID %d matched but no CSV record", id);
+      playErrorTone();
+      showOrphanAnimation(id);
     }
 
     lcd.clear();
   }
 
-  // Idle display (non-blocking)
   updateIdleDisplay();
-
   delay(50);
 }
 
 /* ============================================================
-   FULL CHANGELOG  v2.1 -> v3.0
+   CHANGELOG  v4.0 -> v4.1
 
-   [NEW-01] Fingerprint deletion via web UI
-     - /delete endpoint with admin password protection
-     - /api/students endpoint lists all enrolled students
-     - deleteFingerprint() calls finger.deleteModel()
-     - deleteStudentFromCSV() removes from array and rewrites file
-     - LCD shows deletion confirmation
+   [FIX-20] LittleFS directory iteration + deletion race condition
+     - clearAllAttendanceData() previously called remove() while
+       iterating openDir(), which is undefined behaviour in LittleFS
+       and can skip files or corrupt the directory index
+     - Fix: two-pass approach — collect all matching filenames into
+       a String array first, then delete them in a separate loop
 
-   [NEW-02] Clear attendance/logs button
-     - /clear endpoint with password + "CONFIRM" text verification
-     - clearAllAttendanceData() removes all att_*.csv files
-     - Clears RAM logs, today_scans, IN/OUT state, persistent logs
-     - Students remain enrolled (only attendance is deleted)
+   [FIX-21] JSON injection via unescaped student names / lessons
+     - All handleAPI*() functions concatenated raw user-controlled
+       strings directly into JSON, so a name containing " or \
+       broke the parser and could crash the web UI
+     - Added jsonEscape(src, dst, len) helper — replaces " -> \"
+       and \ -> \\; applied to every string field in every API
+       response: names, lessons, time strings
 
-   [NEW-03] LCD fade-out animation
-     - showSuccessWithFade() displays match then dissolves name
-       right-to-left, character by character, for visual polish
-     - 80ms per character with yield() for WDT safety
+   [FIX-22] Silent failure when sensor matched but no CSV record
+     - When getFingerprintID() returned a valid ID but findStudent()
+       returned -1 (template exists in sensor, deleted from CSV),
+       the scan was silently dropped with no buzzer or LCD message
+     - Added showOrphanAnimation() with playErrorTone() — displays
+       "ORPHAN SCAN / Sensor ID: N / Re-enroll to fix" for 2s
 
-   [NEW-04] Persistent attendance log (survives reboot)
-     - saveRecentLogs() writes logCount + today_scans + day stamp
-       + log entries to /recent_log.dat as binary
-     - loadRecentLogs() restores on boot if same day
-     - Web UI shows continuous log even after power interruption
+   [FIX-23] appendUnknown() called before NTP sync
+     - getFingerprintID() called appendUnknown(getNow()) regardless
+       of whether time was valid, writing "N/A" timestamps into the
+       unknowns CSV before NTP synced
+     - Added early return in appendUnknown() when utc_t < 1e9
 
-   [NEW-05] Admin password changed to "fajer67student"
-     - WiFi password and admin password are now separate
-     - ADMIN_PASS constant used for enroll, delete, clear
+   [FIX-24] Deleted student debounce timer persisted
+     - handleDelete() cleared lastAction[id] but not lastScanTime[id]
+     - If the slot was re-enrolled within SCAN_DEBOUNCE_SEC of the
+       previous student's last scan, the new student's first scan
+       was silently rejected by the debounce check
+     - Fix: lastScanTime[id] = 0 added alongside lastAction[id] = 0
 
-   [NEW-06] Emoji changed from 🎓 to 👨🏻‍🎓
-     - UTF-8 sequence \xF0\x9F\x91\xA8\xF0\x9F\x8F\xBB\xE2\x80\x8D\xF0\x9F\x8E\x93
+   [FIX-25] ArduinoOTA.begin() called unconditionally
+     - ArduinoOTA.begin() was called outside the if(MDNS.begin())
+       block so OTA initialised even when mDNS failed, but
+       ota_enabled stayed false, so ArduinoOTA.handle() was never
+       called — OTA was listening but unserviced
+     - Fix: moved ArduinoOTA setup + begin() + ota_enabled = true
+       fully inside the if(MDNS.begin()) block
 
-   [NEW-07] Timezone display "Iraq/Basrah" in web UI header
+   [FIX-26] Schedule hardcoded in both C++ and JavaScript
+     - Any lesson-time change required editing two places and
+       reflashing the firmware
+     - Added /api/schedule endpoint that serialises the C++ schedule[]
+       struct to JSON; the web UI now fetches it with loadSchedule()
+       at startup instead of using a hardcoded JS array
+     - Single source of truth: only the C++ struct needs editing
 
-   [NEW-08] Removed device_id from web UI, LCD idle, and CSV
-     - LCD idle shows "WiFi✓ Attendance" instead of device name
+   [FIX-27] Single NTP server with no fallback
+     - configTime() was called with only "pool.ntp.org"; if that
+       server was unreachable, time sync silently failed
+     - Now uses three-server form: pool.ntp.org, time.cloudflare.com,
+       time.google.com — applied in both setup() and the 30-min
+       re-sync in loop()
 
-   [NEW-09] Removed class field entirely
-     - Student struct simplified, CSV headers updated
-     - Enroll form has no class input
+   [FIX-28] saveRecentLogs() written on every single scan
+     - Calling saveRecentLogs() on every scan wrote the full log file
+       to flash on each fingerprint event, adding unnecessary wear
+     - Replaced with a dirty-flag pattern: logs_dirty = true on each
+       change; loop() flushes to flash when dirty AND at least
+       LOG_FLUSH_DEBOUNCE_MS (30s) have elapsed since last flush
+     - Critical paths (heap critical, OTA start, scheduled restart)
+       still call saveRecentLogs() directly and are unaffected
 
-   [NEW-10] Removed template_id from downloadable CSV
+   [FIX-29] Admin password compared with == (timing oracle)
+     - server.arg("pass") != String(ADMIN_PASS) short-circuits on the
+       first mismatched character, enabling timing-based attacks on
+       a local network
+     - Replaced with checkAdminPass() — constant-time XOR comparison
+       that always runs for the full password length regardless of
+       where the first mismatch occurs
+     - Applied to all handlers: enroll, delete, clear, manual, ntfy
 
-   [NEW-11] Removed timezone column from downloadable CSV
+   [FIX-30] server.handleClient() missing in enroll blocking loops
+     - During enrollment (up to ~26s total), the main loop was
+       completely blocked so HTTP requests from the web UI timed out
+     - Added server.handleClient() + ArduinoOTA.handle() inside all
+       three blocking while() loops in handleEnroll() (scan1 wait,
+       finger-lift wait, scan2 wait)
 
-   [NEW-12] Placeholder text updates
-     - "e.g." -> "ex:" everywhere
-     - Name placeholders: "fajer" and "Abednabie"
-     - ID placeholder: "ex: 67"
+   [NEW-24] ntfy.sh push notifications
+     - sendNtfyNotification(title, body) fires an HTTP POST to a
+       configurable ntfy.sh URL on every successful scan and manual
+       entry — teacher's phone gets an instant per-scan ping
+     - URL stored in /ntfy_url.txt on LittleFS, loaded at boot
+     - Configurable at runtime via web UI Settings card (⚙) without
+       reflashing — saved with admin password authentication
+     - Test ping sent when URL is saved for verification
+     - Uses ESP8266HTTPClient with 2s timeout to minimise scan delay
+     - Sending an empty URL disables notifications
 
-   [NEW-13] Hidden easter eggs (5 total)
-     - #1: Click copyright name -> alert with 67 message
-     - #2: HTML comment in source code
-     - #3: Click "v3.0" text -> reveals secret code F67A
-     - #4: Uptime exactly 67s shows sparkle in web UI
-     - #5: /67 secret page with celebration animation
-     - Keyboard: type "67" -> title changes temporarily
+   [NEW-25] Manual attendance entry via web UI
+     - New ✏ Manual button in the header opens a card with a student
+       dropdown (loaded from /api/students), IN/OUT selector, and
+       admin password field
+     - /manual GET endpoint writes to the attendance CSV and in-memory
+       log exactly like a real fingerprint scan
+     - Manual entries also trigger ntfy.sh notifications if configured
+     - Useful when the sensor is offline or a student forgets to scan
+     - Logs dirty-flagged for deferred flash write (same as real scans)
 
-   [NEW-14] Anti-restart measures
-     - WiFi.persistent(false) stops flash writes every boot
-     - WiFi.setAutoReconnect(true) for robust reconnection
-     - Heap monitoring with HEAP_CRITICAL_THRESHOLD (4KB)
-     - Emergency state save before any forced restart
-     - Extra yield() calls throughout all loops and animations
+   [NEW-26] Flash storage monitoring + write guards
+     - flashHasSpace(needed) and flashUsedPct() helpers using
+       LittleFS.info() — called before every write operation
+     - appendAttendance(), addStudentToCSV(), appendUnknown() all
+       check flashHasSpace() and skip the write with a debug print
+       if flash is too full, preventing silent data loss
+     - Flash usage % included in /api/status JSON as "flash_pct"
+     - Web UI shows a Flash Used stat box with a live progress bar
+       that turns yellow at 60% and red at 80%
+     - flashUsedPct() printed to Serial in setup() for reference
 
-   [NEW-15] Scheduled auto-restart at 3AM
-     - Only triggers if uptime > 12 hours (prevents boot loops)
-     - Saves time, IN/OUT state, and logs before restart
-     - auto_restarted_today flag prevents multiple restarts
+   [NEW-27] New API endpoints + PWA manifest
+     - /api/absent: returns all students with lastAction==0 during
+       active lesson, annotated with lesson name and during_lesson flag
+     - /api/schedule: serialises the C++ schedule[] to JSON —
+       consumed by the JS updateSchedule() to eliminate duplication
+     - /manifest.json: minimal PWA manifest with theme-color, display
+       standalone, and name — lets Android/iOS prompt "Add to Home
+       Screen" for the web UI
+     - Absent students box rendered in web UI below recent attendance:
+       shows a green "All present" card or a red absent-names table
+       depending on who has lastAction==0 during the active lesson
 
-   [NEW-16] Schedule-aware attendance
-     - ScheduleSlot struct with full weekly practical schedule
-     - Sunday: 3 sessions Computer Maintenance (1hr + 15min breaks)
-     - Monday: Electronic Circuit Design + Networking
-     - getCurrentLesson() determines active lesson by time
-     - Lesson name recorded in attendance CSV and web UI
-     - LCD idle screen shows current lesson when active
-     - Web UI has live schedule card with "NOW" indicator
-
-   [NEW-17] Session tracking
-     - Each scan records which lesson/session it belongs to
-     - LogEntry has lesson field
-     - Web UI attendance table includes Lesson column
-
-   [FIX-13] Stack overflow prevention
-     - All debug output uses char[] buffers via debugPrintF()
-     - Fixed char buffers for day stamps instead of String
-     - Reduced local buffer sizes throughout
-
-   [FIX-14] Heap fragmentation watchdog
-     - checkHeapHealth() monitors every 60s
-     - If free heap < 4KB -> emergency save + restart
-     - Free heap displayed in web UI stats
-
-   [FIX-15] SoftwareSerial buffer overflow protection
-     - 150ms delay after finger.begin() in initSensor()
-     - yield() after every sensor operation loop iteration
-
-   [FIX-16] WiFi flash wear prevention
-     - WiFi.persistent(false) prevents writing credentials
-       to flash on every boot (major cause of flash wear)
-     - WiFi.setAutoReconnect(true) for background recovery
    ============================================================ */
