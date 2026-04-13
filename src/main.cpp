@@ -30,8 +30,8 @@
 // ============================================================
 // CONFIGURATION
 // ============================================================
-const char* WIFI_SSID     = "Abd";
-const char* WIFI_PASS     = "fajer67ii";
+const char* WIFI_SSID     = "ur wifi name";
+const char* WIFI_PASS     = "ur FUCKING PASSWORD";
 const char* ADMIN_PASS    = "fajer67student";
 const char* OTA_PASSWORD  = "fajer67ota";
 const char* MDNS_HOST     = "f-att";           // -> f-att.local
